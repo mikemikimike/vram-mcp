@@ -709,7 +709,7 @@ def _clock(start):
 def test_claim_creates_and_list_claims_returns_it(tmp_path):
     path = tmp_path / "claims.json"
     now_fn = _clock(datetime(2026, 7, 13, 18, 0, 0, tzinfo=timezone.utc))
-    result = claims.claim("llama3.2", "retro-repo", "narration",
+    result = claims.claim("llama3.2", "project-a", "narration",
                           ttl_seconds=3600, path=path, now_fn=now_fn)
     assert "claim_id" in result
     assert result["expires_at"] == "2026-07-13T19:00:00Z"
@@ -717,7 +717,7 @@ def test_claim_creates_and_list_claims_returns_it(tmp_path):
     active = claims.list_claims(path=path, now_fn=now_fn)
     assert len(active) == 1
     assert active[0]["model"] == "llama3.2"
-    assert active[0]["owner"] == "retro-repo"
+    assert active[0]["owner"] == "project-a"
     assert active[0]["purpose"] == "narration"
 
 

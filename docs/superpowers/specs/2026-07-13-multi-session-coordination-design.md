@@ -83,7 +83,7 @@ Three new modules alongside the existing `gpu.py` / `ollama.py` / `core.py` (all
     {
       "claim_id": "b3f1c2a4-...",
       "model": "llama3.2",
-      "owner": "retro-repo",
+      "owner": "project-a",
       "purpose": "narration enrichment",
       "claimed_at": "2026-07-13T18:00:00Z",
       "renewed_at": "2026-07-13T18:05:00Z",

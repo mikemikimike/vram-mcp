@@ -42,7 +42,7 @@ uvx vram-mcp
 Or install from source for development:
 
 ```bash
-git clone https://github.com/kfaim/vram-mcp
+git clone https://github.com/sushiHex/vram-mcp
 cd vram-mcp
 pip install -e .
 ```
@@ -104,4 +104,4 @@ import and are fully unit-tested with mocks — no real GPU, Ollama daemon, or
 
 ## License
 
-MIT © 2026 kfaim
+MIT © 2026 sushiHex

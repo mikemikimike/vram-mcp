@@ -9,7 +9,7 @@ description = "MCP server to inspect and free NVIDIA GPU VRAM via Ollama + nvidi
 readme = "README.md"
 license = { file = "LICENSE" }
 requires-python = ">=3.10"
-authors = [{ name = "kfaim" }]
+authors = [{ name = "sushiHex" }]
 keywords = ["mcp", "ollama", "nvidia", "vram", "gpu", "llm"]
 classifiers = [
     "License :: OSI Approved :: MIT License",
@@ -29,8 +29,9 @@ dev = ["pytest>=7.0"]
 vram-mcp = "vram_mcp.server:main"
 
 [project.urls]
-Homepage = "https://github.com/kfaim/vram-mcp"
-Repository = "https://github.com/kfaim/vram-mcp"
+Homepage = "https://github.com/sushiHex/vram-mcp"
+Repository = "https://github.com/sushiHex/vram-mcp"
+Issues = "https://github.com/sushiHex/vram-mcp/issues"
 
 [tool.hatch.build.targets.wheel]
 packages = ["vram_mcp"]

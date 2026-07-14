@@ -235,6 +235,89 @@ def test_ensure_free_settle_calls_sleep():
     assert calls == [0.5]
 
 
+# ---- is_protected -----------------------------------------------------------
+
+def test_is_protected_true_when_active_claim_exists():
+    protected, detail = core.is_protected(
+        "m", list_claims_fn=lambda name: [{"owner": "x"}],
+        find_pid_fn=lambda name: None, busy_fn=lambda pid: None,
+    )
+    assert protected is True
+    assert detail["claims"] == [{"owner": "x"}]
+
+
+def test_is_protected_true_when_busy():
+    protected, detail = core.is_protected(
+        "m", list_claims_fn=lambda name: [], find_pid_fn=lambda name: 123,
+        busy_fn=lambda pid: True,
+    )
+    assert protected is True
+    assert detail["busy"] is True
+
+
+def test_is_protected_false_when_unclaimed_and_idle():
+    protected, _ = core.is_protected(
+        "m", list_claims_fn=lambda name: [], find_pid_fn=lambda name: 123,
+        busy_fn=lambda pid: False,
+    )
+    assert protected is False
+
+
+def test_is_protected_false_when_no_pid_and_no_claim():
+    protected, detail = core.is_protected(
+        "m", list_claims_fn=lambda name: [], find_pid_fn=lambda name: None,
+        busy_fn=lambda pid: True,  # never called: no pid to check
+    )
+    assert protected is False
+    assert detail["busy"] is None
+
+
+# ---- ensure_free protection ---------------------------------------------------
+
+def test_ensure_free_skips_protected_model_and_reports_declined():
+    models = [
+        {"name": "protected", "size_vram": gb_bytes(10), "expires_at": None},
+        {"name": "free-game", "size_vram": gb_bytes(6), "expires_at": None},
+    ]
+    ollama = FakeOllama(models)
+    gpu_fn = gpu_fn_sequence([1000, 7000])
+
+    result = core.ensure_free(
+        6, gpu_fn, ollama, sleep=lambda *_: None,
+        list_claims_fn=lambda name: [{"owner": "other"}] if name == "protected" else [],
+        find_pid_fn=lambda name: None,
+        busy_fn=lambda pid: None,
+    )
+    assert ollama.unloaded == ["free-game"]  # "protected" skipped despite being largest
+    assert result["ok"] is True
+    assert len(result["declined"]) == 1
+    assert result["declined"][0]["name"] == "protected"
+
+
+def test_ensure_free_force_bypasses_protection():
+    models = [{"name": "protected", "size_vram": gb_bytes(10), "expires_at": None}]
+    ollama = FakeOllama(models)
+    gpu_fn = gpu_fn_sequence([1000, 11000])
+
+    result = core.ensure_free(
+        8, gpu_fn, ollama, sleep=lambda *_: None, force=True,
+        list_claims_fn=lambda name: [{"owner": "other"}],
+        find_pid_fn=lambda name: None, busy_fn=lambda pid: None,
+    )
+    assert ollama.unloaded == ["protected"]
+    assert result["declined"] == []
+
+
+def test_ensure_free_protection_noop_when_fns_not_provided():
+    """Existing callers that don't wire claims/busy see unchanged behavior."""
+    models = [{"name": "a", "size_vram": gb_bytes(10), "expires_at": None}]
+    ollama = FakeOllama(models)
+    gpu_fn = gpu_fn_sequence([1000, 11000])
+    result = core.ensure_free(8, gpu_fn, ollama, sleep=lambda *_: None)
+    assert ollama.unloaded == ["a"]
+    assert result["declined"] == []
+
+
 # ---- advise -----------------------------------------------------------------
 
 def test_advise_recommends_max_loaded_when_many_and_low_free():

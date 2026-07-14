@@ -107,12 +107,32 @@ def combined_status(
     return result
 
 
+def is_protected(
+    model_name: str, list_claims_fn, find_pid_fn, busy_fn,
+) -> tuple[bool, dict]:
+    """Is ``model_name`` unsafe to evict right now?
+
+    Protected if EITHER an active claim exists OR its best-effort ``busy``
+    signal is ``True`` — not claim-status alone, so an uncooperative caller
+    that never calls ``claim()`` still can't make a real in-flight
+    generation trivially interruptible. Returns ``(protected, detail)``,
+    ``detail`` = ``{"claims": [...], "busy": bool | None}``.
+    """
+    active_claims = list_claims_fn(model_name)
+    pid = find_pid_fn(model_name)
+    busy = busy_fn(pid) if pid is not None else None
+    protected = bool(active_claims) or busy is True
+    return protected, {"claims": active_claims, "busy": busy}
+
+
 def ensure_free(
     target_gb: float,
     gpu_status_fn: Callable[[], list[dict]],
     ollama,
     settle: float = 0.0,
     sleep: Callable[[float], None] = time.sleep,
+    *,
+    list_claims_fn=None, find_pid_fn=None, busy_fn=None, force: bool = False,
 ) -> dict:
     """Free VRAM until at least ``target_gb`` is available.
 
@@ -122,9 +142,17 @@ def ensure_free(
     seconds between, if given, to let the driver actually release the memory),
     and stop as soon as the target is met or nothing is left to unload.
 
-    Returns ``{"ok", "already_free", "free_mb", "unloaded", "target_mb"}``.
-    ``ok`` is ``False`` if the target could not be reached (including when VRAM
-    is unknown, i.e. ``free_mb is None``, so we cannot prove success).
+    Protection: when ``list_claims_fn``, ``find_pid_fn``, and ``busy_fn`` are
+    ALL provided and ``force`` is False, a model with an active claim or a
+    ``busy == True`` signal is skipped rather than evicted, and reported in
+    ``declined`` (with its claim/busy detail) even if the VRAM target isn't
+    fully reached. Protection is a no-op (nothing skipped) if any of the
+    three callables is omitted — existing callers see unchanged behavior.
+
+    Returns ``{"ok", "already_free", "free_mb", "unloaded", "declined",
+    "target_mb"}``. ``ok`` is ``False`` if the target could not be reached
+    (including when VRAM is unknown, i.e. ``free_mb is None``, so we cannot
+    prove success).
 
     ``sleep`` is injected so tests never actually wait.
     """
@@ -140,6 +168,7 @@ def ensure_free(
             "already_free": True,
             "free_mb": free,
             "unloaded": [],
+            "declined": [],
             "target_mb": target_mb,
         }
 
@@ -150,11 +179,22 @@ def ensure_free(
         reverse=True,
     )
 
+    protection_enabled = (
+        not force and list_claims_fn is not None
+        and find_pid_fn is not None and busy_fn is not None
+    )
+
     unloaded: list[str] = []
+    declined: list[dict] = []
     for m in models:
         name = m["name"]
         if not name:
             continue
+        if protection_enabled:
+            protected, detail = is_protected(name, list_claims_fn, find_pid_fn, busy_fn)
+            if protected:
+                declined.append({"name": name, **detail})
+                continue
         if ollama.unload(name):
             unloaded.append(name)
         if settle:
@@ -169,6 +209,7 @@ def ensure_free(
         "already_free": False,
         "free_mb": free,
         "unloaded": unloaded,
+        "declined": declined,
         "target_mb": target_mb,
     }
 

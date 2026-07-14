@@ -25,31 +25,86 @@ def _bytes_to_mb(value) -> int:
 
 
 def _loaded_models(ollama) -> list[dict]:
-    """Normalize ``ollama.ps()`` rows to ``{name, size_vram_mb, expires_at}``."""
+    """Normalize ``ollama.ps()`` rows to the base per-model status dict.
+
+    ``offloaded_to_cpu`` is True when ``size_vram_mb < total_size_mb`` — part
+    of the model spilled to system RAM. When the raw row doesn't carry a
+    ``size`` field at all, ``total_size_mb`` is 0 and offload can't be
+    detected (reported as False, never a guess of True).
+    """
     loaded = []
     for m in ollama.ps():
+        size_mb = _bytes_to_mb(m.get("size", 0))
+        vram_mb = _bytes_to_mb(m.get("size_vram", 0))
         loaded.append(
             {
                 "name": m.get("name"),
-                "size_vram_mb": _bytes_to_mb(m.get("size_vram", 0)),
+                "size_vram_mb": vram_mb,
+                "total_size_mb": size_mb,
+                "offloaded_to_cpu": vram_mb < size_mb,
                 "expires_at": m.get("expires_at"),
             }
         )
     return loaded
 
 
-def combined_status(gpu_status_fn: Callable[[], list[dict]], ollama) -> dict:
+def attach_claims(loaded: list[dict], list_claims_fn) -> list[dict]:
+    """Attach every active claim (a list, possibly empty) to each model dict."""
+    return [{**m, "claims": list_claims_fn(m["name"])} for m in loaded]
+
+
+def attach_busy(loaded: list[dict], find_pid_fn, busy_fn) -> tuple[list[dict], set]:
+    """Attach a best-effort ``busy`` signal to each model dict.
+
+    Returns ``(enriched, resolved_pids)`` — ``resolved_pids`` lets callers
+    exclude these PIDs from a general "other processes" survey, since they're
+    already represented as Ollama model entries.
+    """
+    out = []
+    resolved: set = set()
+    for m in loaded:
+        pid = find_pid_fn(m["name"])
+        busy = busy_fn(pid) if pid is not None else None
+        if pid is not None:
+            resolved.add(pid)
+        out.append({**m, "busy": busy})
+    return out, resolved
+
+
+def other_processes(nvml_processes_fn, exclude_pids: set) -> list[dict]:
+    """Every NVML-visible VRAM holder that isn't an already-listed Ollama model."""
+    return [p for p in nvml_processes_fn() if p["pid"] not in exclude_pids]
+
+
+def combined_status(
+    gpu_status_fn: Callable[[], list[dict]], ollama, *,
+    list_claims_fn=None, find_pid_fn=None, busy_fn=None, nvml_processes_fn=None,
+) -> dict:
     """Snapshot of GPUs + loaded models + best free VRAM.
 
-    Returns ``{"gpus": [...], "loaded": [...], "free_mb": int | None}`` where
-    ``free_mb`` is the max free across GPUs, or ``None`` when VRAM is unknown.
+    Returns ``{"gpus": [...], "loaded": [...], "free_mb": int | None}``, plus
+    ``"other_processes"`` when ``nvml_processes_fn`` is given. Each loaded
+    model always carries ``total_size_mb``/``offloaded_to_cpu``; it also
+    carries ``claims`` when ``list_claims_fn`` is given, and ``busy`` when
+    both ``find_pid_fn`` and ``busy_fn`` are given. The optional kwargs let
+    ``server.py`` always wire the real implementations in production while
+    tests exercise the base case without them.
     """
     gpus = gpu_status_fn()
-    return {
+    loaded = _loaded_models(ollama)
+    resolved_pids: set = set()
+    if list_claims_fn is not None:
+        loaded = attach_claims(loaded, list_claims_fn)
+    if find_pid_fn is not None and busy_fn is not None:
+        loaded, resolved_pids = attach_busy(loaded, find_pid_fn, busy_fn)
+    result = {
         "gpus": gpus,
-        "loaded": _loaded_models(ollama),
+        "loaded": loaded,
         "free_mb": _gpu.max_free_mb(gpus),
     }
+    if nvml_processes_fn is not None:
+        result["other_processes"] = other_processes(nvml_processes_fn, resolved_pids)
+    return result
 
 
 def ensure_free(

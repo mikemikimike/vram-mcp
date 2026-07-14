@@ -61,8 +61,8 @@ def test_combined_status():
     assert status["free_mb"] == 6000
     assert len(status["gpus"]) == 1
     assert status["loaded"] == [
-        {"name": "big", "size_vram_mb": 8192,
-         "expires_at": "2026-07-11T10:00:00Z"},
+        {"name": "big", "size_vram_mb": 8192, "total_size_mb": 8192,
+         "offloaded_to_cpu": False, "expires_at": "2026-07-11T10:00:00Z"},
     ]
 
 
@@ -71,6 +71,85 @@ def test_combined_status_no_gpu():
     assert status["gpus"] == []
     assert status["free_mb"] is None
     assert status["loaded"] == []
+
+
+# ---- offload detection -------------------------------------------------------
+
+def test_loaded_models_detects_cpu_offload():
+    models = [
+        {"name": "partial", "size": gb_bytes(10), "size_vram": gb_bytes(6),
+         "expires_at": None},
+    ]
+    status = core.combined_status(gpu_fn_const(4000), FakeOllama(models))
+    entry = status["loaded"][0]
+    assert entry["total_size_mb"] == 10240
+    assert entry["size_vram_mb"] == 6144
+    assert entry["offloaded_to_cpu"] is True
+
+
+# ---- attach_claims ------------------------------------------------------------
+
+def test_attach_claims_adds_claims_list_per_model():
+    loaded = [{"name": "m1"}, {"name": "m2"}]
+
+    def list_claims_fn(model):
+        return [{"owner": "x"}] if model == "m1" else []
+
+    result = core.attach_claims(loaded, list_claims_fn)
+    assert result[0]["claims"] == [{"owner": "x"}]
+    assert result[1]["claims"] == []
+
+
+# ---- attach_busy ----------------------------------------------------------------
+
+def test_attach_busy_resolves_pid_and_busy_flag():
+    loaded = [{"name": "m1"}, {"name": "m2"}]
+
+    def find_pid_fn(model):
+        return 123 if model == "m1" else None
+
+    def busy_fn(pid):
+        return pid == 123
+
+    result, resolved = core.attach_busy(loaded, find_pid_fn, busy_fn)
+    assert result[0]["busy"] is True
+    assert result[1]["busy"] is None  # no pid -> never call busy_fn's real signal
+    assert resolved == {123}
+
+
+# ---- other_processes ------------------------------------------------------------
+
+def test_other_processes_excludes_known_ollama_pids():
+    def nvml_processes_fn():
+        return [
+            {"pid": 100, "size_mb": 500, "kind": "compute"},
+            {"pid": 200, "size_mb": 300, "kind": "graphics"},
+        ]
+
+    result = core.other_processes(nvml_processes_fn, exclude_pids={100})
+    assert result == [{"pid": 200, "size_mb": 300, "kind": "graphics"}]
+
+
+# ---- combined_status full wiring -------------------------------------------------
+
+def test_combined_status_full_wiring():
+    models = [{"name": "m1", "size": gb_bytes(4), "size_vram": gb_bytes(4),
+              "expires_at": None}]
+    status = core.combined_status(
+        gpu_fn_const(8000), FakeOllama(models),
+        list_claims_fn=lambda model: [{"owner": "x"}],
+        find_pid_fn=lambda model: 555,
+        busy_fn=lambda pid: True,
+        nvml_processes_fn=lambda: [
+            {"pid": 555, "size_mb": 4096, "kind": "compute"},
+            {"pid": 999, "size_mb": 100, "kind": "graphics"},
+        ],
+    )
+    entry = status["loaded"][0]
+    assert entry["claims"] == [{"owner": "x"}]
+    assert entry["busy"] is True
+    # pid 555 IS the "m1" runner -> excluded from other_processes; pid 999 stays.
+    assert status["other_processes"] == [{"pid": 999, "size_mb": 100, "kind": "graphics"}]
 
 
 # ---- ensure_free ------------------------------------------------------------

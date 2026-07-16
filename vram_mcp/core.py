@@ -48,26 +48,74 @@ def _loaded_models(ollama) -> list[dict]:
     return loaded
 
 
-def attach_claims(loaded: list[dict], list_claims_fn) -> list[dict]:
-    """Attach every active claim (a list, possibly empty) to each model dict."""
-    return [{**m, "claims": list_claims_fn(m["name"])} for m in loaded]
+class Snapshot:
+    """One consistent capture of the coordination signals, taken ONCE per
+    operation and shared across every model it touches.
+
+    Before this existed, each loaded model re-ran the full pipeline (a process
+    listing + a manifest walk + an NVML session + a claims-file read PER
+    model, and again per ``ensure_free`` loop iteration) — N× redundant
+    subprocess/IO work for data that cannot meaningfully change within one
+    call. All three inputs are plain data; a Snapshot is trivially fake-able
+    in tests.
+
+    * ``all_claims`` — every active claim record (one ledger read).
+    * ``pid_map`` — Ollama tag → runner PID (one process listing + one
+      manifest walk; aliases sharing a blob all map to the runner's PID).
+    * ``busy_map`` — runner PID → ``True | False | None`` (one NVML session).
+    """
+
+    def __init__(self, all_claims: list[dict], pid_map: dict,
+                 busy_map: dict) -> None:
+        self.all_claims = all_claims
+        self.pid_map = pid_map
+        self.busy_map = busy_map
+
+    @classmethod
+    def capture(cls, all_claims_fn, pid_map_fn, busy_map_fn) -> "Snapshot":
+        """Run the three collectors once. ``busy_map_fn`` receives the PIDs
+        the pid_map surfaced, so the NVML fetch covers exactly what's needed."""
+        all_claims = all_claims_fn() if all_claims_fn else []
+        pid_map = pid_map_fn() if pid_map_fn else {}
+        pids = sorted(set(pid_map.values()))
+        busy_map = busy_map_fn(pids) if (busy_map_fn and pids) else {}
+        return cls(all_claims, pid_map, busy_map)
+
+    def claims_for(self, model_name) -> list[dict]:
+        """Active claims on ``model_name``; [] for a None/unknown name (a
+        nameless ps() row must never be attributed everyone's claims)."""
+        if not model_name:
+            return []
+        return [c for c in self.all_claims
+                if isinstance(c, dict) and c.get("model") == model_name]
+
+    def pid_for(self, model_name):
+        if not model_name:
+            return None
+        return self.pid_map.get(model_name)
+
+    def busy_for(self, model_name):
+        pid = self.pid_for(model_name)
+        if pid is None:
+            return None
+        return self.busy_map.get(pid)
 
 
-def attach_busy(loaded: list[dict], find_pid_fn, busy_fn) -> tuple[list[dict], set]:
-    """Attach a best-effort ``busy`` signal to each model dict.
+def attach_coordination(loaded: list[dict], snap: Snapshot) -> tuple[list[dict], set]:
+    """Attach ``claims`` + ``busy`` to each model dict from one Snapshot.
 
     Returns ``(enriched, resolved_pids)`` — ``resolved_pids`` lets callers
-    exclude these PIDs from a general "other processes" survey, since they're
-    already represented as Ollama model entries.
+    exclude Ollama-runner PIDs from a general "other processes" survey, since
+    they're already represented as model entries.
     """
     out = []
     resolved: set = set()
     for m in loaded:
-        pid = find_pid_fn(m["name"])
-        busy = busy_fn(pid) if pid is not None else None
+        name = m.get("name")
+        pid = snap.pid_for(name)
         if pid is not None:
             resolved.add(pid)
-        out.append({**m, "busy": busy})
+        out.append({**m, "claims": snap.claims_for(name), "busy": snap.busy_for(name)})
     return out, resolved
 
 
@@ -78,25 +126,23 @@ def other_processes(nvml_processes_fn, exclude_pids: set) -> list[dict]:
 
 def combined_status(
     gpu_status_fn: Callable[[], list[dict]], ollama, *,
-    list_claims_fn=None, find_pid_fn=None, busy_fn=None, nvml_processes_fn=None,
+    snapshot_fn=None, nvml_processes_fn=None,
 ) -> dict:
     """Snapshot of GPUs + loaded models + best free VRAM.
 
     Returns ``{"gpus": [...], "loaded": [...], "free_mb": int | None}``, plus
     ``"other_processes"`` when ``nvml_processes_fn`` is given. Each loaded
-    model always carries ``total_size_mb``/``offloaded_to_cpu``; it also
-    carries ``claims`` when ``list_claims_fn`` is given, and ``busy`` when
-    both ``find_pid_fn`` and ``busy_fn`` are given. The optional kwargs let
-    ``server.py`` always wire the real implementations in production while
-    tests exercise the base case without them.
+    model always carries ``total_size_mb``/``offloaded_to_cpu``; when
+    ``snapshot_fn`` (``() -> Snapshot``) is given it also carries ``claims``
+    and ``busy``, all derived from ONE snapshot capture rather than per-model
+    re-collection. Omitting the kwargs gives the plain base shape (tests,
+    ``advise``).
     """
     gpus = gpu_status_fn()
     loaded = _loaded_models(ollama)
     resolved_pids: set = set()
-    if list_claims_fn is not None:
-        loaded = attach_claims(loaded, list_claims_fn)
-    if find_pid_fn is not None and busy_fn is not None:
-        loaded, resolved_pids = attach_busy(loaded, find_pid_fn, busy_fn)
+    if snapshot_fn is not None:
+        loaded, resolved_pids = attach_coordination(loaded, snapshot_fn())
     result = {
         "gpus": gpus,
         "loaded": loaded,
@@ -107,9 +153,7 @@ def combined_status(
     return result
 
 
-def is_protected(
-    model_name: str, list_claims_fn, find_pid_fn, busy_fn,
-) -> tuple[bool, dict]:
+def is_protected(model_name: str, snap: Snapshot) -> tuple[bool, dict]:
     """Is ``model_name`` unsafe to evict right now?
 
     Protected if EITHER an active claim exists OR its best-effort ``busy``
@@ -118,9 +162,8 @@ def is_protected(
     generation trivially interruptible. Returns ``(protected, detail)``,
     ``detail`` = ``{"claims": [...], "busy": bool | None}``.
     """
-    active_claims = list_claims_fn(model_name)
-    pid = find_pid_fn(model_name)
-    busy = busy_fn(pid) if pid is not None else None
+    active_claims = snap.claims_for(model_name)
+    busy = snap.busy_for(model_name)
     protected = bool(active_claims) or busy is True
     return protected, {"claims": active_claims, "busy": busy}
 
@@ -132,22 +175,23 @@ def ensure_free(
     settle: float = 0.0,
     sleep: Callable[[float], None] = time.sleep,
     *,
-    list_claims_fn=None, find_pid_fn=None, busy_fn=None, force: bool = False,
+    snapshot_fn=None, force: bool = False,
 ) -> dict:
     """Free VRAM until at least ``target_gb`` is available.
 
     Fast path: if current max free already meets the target, return without
     unloading anything. Otherwise evict loaded models **largest ``size_vram``
     first**, re-reading free VRAM after each eviction (sleeping ``settle``
-    seconds between, if given, to let the driver actually release the memory),
-    and stop as soon as the target is met or nothing is left to unload.
+    seconds after each SUCCESSFUL unload, if given, to let the driver
+    actually release the memory), and stop as soon as the target is met or
+    nothing is left to unload.
 
-    Protection: when ``list_claims_fn``, ``find_pid_fn``, and ``busy_fn`` are
-    ALL provided and ``force`` is False, a model with an active claim or a
-    ``busy == True`` signal is skipped rather than evicted, and reported in
-    ``declined`` (with its claim/busy detail) even if the VRAM target isn't
-    fully reached. Protection is a no-op (nothing skipped) if any of the
-    three callables is omitted — existing callers see unchanged behavior.
+    Protection: when ``snapshot_fn`` (``() -> Snapshot``) is provided and
+    ``force`` is False, the coordination snapshot is captured ONCE before the
+    loop, and any model with an active claim or ``busy == True`` is skipped
+    rather than evicted, reported in ``declined`` (with claim/busy detail)
+    even if the VRAM target isn't fully reached. Protection is a no-op when
+    ``snapshot_fn`` is omitted.
 
     Returns ``{"ok", "already_free", "free_mb", "unloaded", "declined",
     "target_mb"}``. ``ok`` is ``False`` if the target could not be reached
@@ -179,10 +223,10 @@ def ensure_free(
         reverse=True,
     )
 
-    protection_enabled = (
-        not force and list_claims_fn is not None
-        and find_pid_fn is not None and busy_fn is not None
-    )
+    # ONE snapshot for the whole eviction pass: within a single call the
+    # claims/pid/busy state is already stale by less than the settle sleep,
+    # so re-collecting it per iteration bought nothing but subprocess churn.
+    snap = snapshot_fn() if (snapshot_fn is not None and not force) else None
 
     unloaded: list[str] = []
     declined: list[dict] = []
@@ -190,15 +234,15 @@ def ensure_free(
         name = m["name"]
         if not name:
             continue
-        if protection_enabled:
-            protected, detail = is_protected(name, list_claims_fn, find_pid_fn, busy_fn)
+        if snap is not None:
+            protected, detail = is_protected(name, snap)
             if protected:
                 declined.append({"name": name, **detail})
                 continue
         if ollama.unload(name):
             unloaded.append(name)
-        if settle:
-            sleep(settle)
+            if settle:
+                sleep(settle)
         free = current_free()
         if free is not None and free >= target_mb:
             break

@@ -87,34 +87,73 @@ def test_loaded_models_detects_cpu_offload():
     assert entry["offloaded_to_cpu"] is True
 
 
-# ---- attach_claims ------------------------------------------------------------
+# ---- Snapshot ------------------------------------------------------------------
 
-def test_attach_claims_adds_claims_list_per_model():
+def _snap(all_claims=None, pid_map=None, busy_map=None):
+    return core.Snapshot(all_claims or [], pid_map or {}, busy_map or {})
+
+
+def test_snapshot_capture_runs_each_collector_once():
+    calls = {"claims": 0, "pids": 0, "busy": 0}
+
+    def all_claims_fn():
+        calls["claims"] += 1
+        return [{"model": "m1", "owner": "x"}]
+
+    def pid_map_fn():
+        calls["pids"] += 1
+        return {"m1": 123, "m2": 456}
+
+    def busy_map_fn(pids):
+        calls["busy"] += 1
+        assert pids == [123, 456]        # exactly the pids the map surfaced
+        return {123: True, 456: False}
+
+    snap = core.Snapshot.capture(all_claims_fn, pid_map_fn, busy_map_fn)
+    assert calls == {"claims": 1, "pids": 1, "busy": 1}
+    assert snap.busy_for("m1") is True
+    assert snap.busy_for("m2") is False
+
+
+def test_snapshot_capture_skips_busy_fetch_when_no_pids():
+    def busy_map_fn(pids):
+        raise AssertionError("must not be called with no pids")
+
+    snap = core.Snapshot.capture(lambda: [], lambda: {}, busy_map_fn)
+    assert snap.busy_for("anything") is None
+
+
+def test_snapshot_none_name_gets_no_claims_and_no_busy():
+    # A nameless ps() row must NEVER be attributed everyone's claims or a pid.
+    snap = _snap(all_claims=[{"model": "m1", "owner": "x"}],
+                 pid_map={"m1": 123}, busy_map={123: True})
+    assert snap.claims_for(None) == []
+    assert snap.pid_for(None) is None
+    assert snap.busy_for(None) is None
+
+
+# ---- attach_coordination ---------------------------------------------------------
+
+def test_attach_coordination_adds_claims_and_busy():
     loaded = [{"name": "m1"}, {"name": "m2"}]
-
-    def list_claims_fn(model):
-        return [{"owner": "x"}] if model == "m1" else []
-
-    result = core.attach_claims(loaded, list_claims_fn)
-    assert result[0]["claims"] == [{"owner": "x"}]
-    assert result[1]["claims"] == []
-
-
-# ---- attach_busy ----------------------------------------------------------------
-
-def test_attach_busy_resolves_pid_and_busy_flag():
-    loaded = [{"name": "m1"}, {"name": "m2"}]
-
-    def find_pid_fn(model):
-        return 123 if model == "m1" else None
-
-    def busy_fn(pid):
-        return pid == 123
-
-    result, resolved = core.attach_busy(loaded, find_pid_fn, busy_fn)
+    snap = _snap(all_claims=[{"model": "m1", "owner": "x"}],
+                 pid_map={"m1": 123}, busy_map={123: True})
+    result, resolved = core.attach_coordination(loaded, snap)
+    assert result[0]["claims"] == [{"model": "m1", "owner": "x"}]
     assert result[0]["busy"] is True
-    assert result[1]["busy"] is None  # no pid -> never call busy_fn's real signal
+    assert result[1]["claims"] == []
+    assert result[1]["busy"] is None   # no pid -> undetermined, never guessed
     assert resolved == {123}
+
+
+def test_attach_coordination_nameless_row_stays_unattributed():
+    loaded = [{"name": None}]
+    snap = _snap(all_claims=[{"model": "m1", "owner": "x"}],
+                 pid_map={"m1": 123}, busy_map={123: True})
+    result, resolved = core.attach_coordination(loaded, snap)
+    assert result[0]["claims"] == []
+    assert result[0]["busy"] is None
+    assert resolved == set()
 
 
 # ---- other_processes ------------------------------------------------------------
@@ -135,18 +174,18 @@ def test_other_processes_excludes_known_ollama_pids():
 def test_combined_status_full_wiring():
     models = [{"name": "m1", "size": gb_bytes(4), "size_vram": gb_bytes(4),
               "expires_at": None}]
+    snap = _snap(all_claims=[{"model": "m1", "owner": "x"}],
+                 pid_map={"m1": 555}, busy_map={555: True})
     status = core.combined_status(
         gpu_fn_const(8000), FakeOllama(models),
-        list_claims_fn=lambda model: [{"owner": "x"}],
-        find_pid_fn=lambda model: 555,
-        busy_fn=lambda pid: True,
+        snapshot_fn=lambda: snap,
         nvml_processes_fn=lambda: [
             {"pid": 555, "size_mb": 4096, "kind": "compute"},
             {"pid": 999, "size_mb": 100, "kind": "graphics"},
         ],
     )
     entry = status["loaded"][0]
-    assert entry["claims"] == [{"owner": "x"}]
+    assert entry["claims"] == [{"model": "m1", "owner": "x"}]
     assert entry["busy"] is True
     # pid 555 IS the "m1" runner -> excluded from other_processes; pid 999 stays.
     assert status["other_processes"] == [{"pid": 999, "size_mb": 100, "kind": "graphics"}]
@@ -238,36 +277,28 @@ def test_ensure_free_settle_calls_sleep():
 # ---- is_protected -----------------------------------------------------------
 
 def test_is_protected_true_when_active_claim_exists():
-    protected, detail = core.is_protected(
-        "m", list_claims_fn=lambda name: [{"owner": "x"}],
-        find_pid_fn=lambda name: None, busy_fn=lambda pid: None,
-    )
+    snap = _snap(all_claims=[{"model": "m", "owner": "x"}])
+    protected, detail = core.is_protected("m", snap)
     assert protected is True
-    assert detail["claims"] == [{"owner": "x"}]
+    assert detail["claims"] == [{"model": "m", "owner": "x"}]
 
 
 def test_is_protected_true_when_busy():
-    protected, detail = core.is_protected(
-        "m", list_claims_fn=lambda name: [], find_pid_fn=lambda name: 123,
-        busy_fn=lambda pid: True,
-    )
+    snap = _snap(pid_map={"m": 123}, busy_map={123: True})
+    protected, detail = core.is_protected("m", snap)
     assert protected is True
     assert detail["busy"] is True
 
 
 def test_is_protected_false_when_unclaimed_and_idle():
-    protected, _ = core.is_protected(
-        "m", list_claims_fn=lambda name: [], find_pid_fn=lambda name: 123,
-        busy_fn=lambda pid: False,
-    )
+    snap = _snap(pid_map={"m": 123}, busy_map={123: False})
+    protected, _ = core.is_protected("m", snap)
     assert protected is False
 
 
 def test_is_protected_false_when_no_pid_and_no_claim():
-    protected, detail = core.is_protected(
-        "m", list_claims_fn=lambda name: [], find_pid_fn=lambda name: None,
-        busy_fn=lambda pid: True,  # never called: no pid to check
-    )
+    snap = _snap(busy_map={123: True})   # a busy pid exists, but not for "m"
+    protected, detail = core.is_protected("m", snap)
     assert protected is False
     assert detail["busy"] is None
 
@@ -284,9 +315,8 @@ def test_ensure_free_skips_protected_model_and_reports_declined():
 
     result = core.ensure_free(
         6, gpu_fn, ollama, sleep=lambda *_: None,
-        list_claims_fn=lambda name: [{"owner": "other"}] if name == "protected" else [],
-        find_pid_fn=lambda name: None,
-        busy_fn=lambda pid: None,
+        snapshot_fn=lambda: _snap(
+            all_claims=[{"model": "protected", "owner": "other"}]),
     )
     assert ollama.unloaded == ["free-game"]  # "protected" skipped despite being largest
     assert result["ok"] is True
@@ -294,28 +324,70 @@ def test_ensure_free_skips_protected_model_and_reports_declined():
     assert result["declined"][0]["name"] == "protected"
 
 
-def test_ensure_free_force_bypasses_protection():
+def test_ensure_free_snapshots_once_for_the_whole_pass():
+    """The coordination snapshot is captured ONCE per ensure_free call, not
+    per candidate model — the old shape re-ran subprocess/NVML/file reads
+    every loop iteration."""
+    models = [
+        {"name": "a", "size_vram": gb_bytes(4), "expires_at": None},
+        {"name": "b", "size_vram": gb_bytes(4), "expires_at": None},
+        {"name": "c", "size_vram": gb_bytes(4), "expires_at": None},
+    ]
+    ollama = FakeOllama(models)
+    gpu_fn = gpu_fn_sequence([1000, 2000, 3000, 13000])
+    calls = {"n": 0}
+
+    def snapshot_fn():
+        calls["n"] += 1
+        return _snap()
+
+    core.ensure_free(12, gpu_fn, ollama, sleep=lambda *_: None,
+                     snapshot_fn=snapshot_fn)
+    assert calls["n"] == 1
+
+
+def test_ensure_free_force_bypasses_protection_without_snapshotting():
     models = [{"name": "protected", "size_vram": gb_bytes(10), "expires_at": None}]
     ollama = FakeOllama(models)
     gpu_fn = gpu_fn_sequence([1000, 11000])
 
+    def snapshot_fn():
+        raise AssertionError("force=True must not pay for a snapshot")
+
     result = core.ensure_free(
         8, gpu_fn, ollama, sleep=lambda *_: None, force=True,
-        list_claims_fn=lambda name: [{"owner": "other"}],
-        find_pid_fn=lambda name: None, busy_fn=lambda pid: None,
+        snapshot_fn=snapshot_fn,
     )
     assert ollama.unloaded == ["protected"]
     assert result["declined"] == []
 
 
-def test_ensure_free_protection_noop_when_fns_not_provided():
-    """Existing callers that don't wire claims/busy see unchanged behavior."""
+def test_ensure_free_protection_noop_when_snapshot_not_provided():
+    """Existing callers that don't wire a snapshot see unchanged behavior."""
     models = [{"name": "a", "size_vram": gb_bytes(10), "expires_at": None}]
     ollama = FakeOllama(models)
     gpu_fn = gpu_fn_sequence([1000, 11000])
     result = core.ensure_free(8, gpu_fn, ollama, sleep=lambda *_: None)
     assert ollama.unloaded == ["a"]
     assert result["declined"] == []
+
+
+def test_ensure_free_no_settle_sleep_when_unload_fails():
+    """The settle sleep exists to let the driver release memory after an
+    eviction — a FAILED unload released nothing, so sleeping is pure waste."""
+    class RefusingOllama(FakeOllama):
+        def unload(self, model):
+            self.unloaded.append(model)
+            return False
+
+    models = [{"name": "a", "size_vram": gb_bytes(4), "expires_at": None}]
+    ollama = RefusingOllama(models)
+    gpu_fn = gpu_fn_sequence([1000, 1000])
+    sleeps = []
+    core.ensure_free(8, gpu_fn, ollama, settle=0.5,
+                     sleep=lambda s: sleeps.append(s))
+    assert ollama.unloaded == ["a"]   # attempt made
+    assert sleeps == []               # but no pointless settle wait
 
 
 # ---- advise -----------------------------------------------------------------

@@ -33,10 +33,11 @@ agent needs to make room before loading the next one.
 
 ## Install
 
-Run directly with [uv](https://docs.astral.sh/uv/) (no install needed):
+Run directly from GitHub with [uv](https://docs.astral.sh/uv/) (no install needed;
+the package is not on PyPI):
 
 ```bash
-uvx vram-mcp
+uvx --from git+https://github.com/sushiHex/vram-mcp vram-mcp
 ```
 
 Or install from source for development:
@@ -66,11 +67,14 @@ Desktop):
   "mcpServers": {
     "vram": {
       "command": "uvx",
-      "args": ["vram-mcp"]
+      "args": ["--from", "git+https://github.com/sushiHex/vram-mcp", "vram-mcp"]
     }
   }
 }
 ```
+
+Or, with a source checkout installed via `pip install -e .`, point `command`
+directly at the installed `vram-mcp` script.
 
 ## Configuration
 
@@ -93,9 +97,10 @@ pip install -e .
 python -m pytest -q
 ```
 
-The logic modules (`gpu.py`, `ollama.py`, `core.py`) are free of any `mcp`
-import and are fully unit-tested with mocks — no real GPU, Ollama daemon, or
-`mcp` package required to run the test suite.
+The logic modules (`gpu.py`, `ollama.py`, `core.py`, `nvml.py`,
+`ollama_correlate.py`, `claims.py`) are free of any `mcp` import and are fully
+unit-tested with mocks — no real GPU, Ollama daemon, or `mcp` package required
+to run the test suite.
 
 ## Roadmap
 

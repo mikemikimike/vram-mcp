@@ -43,6 +43,7 @@ class FakeNvml:
         self.fail_graphics = fail_graphics
         self.fail_utilization = fail_utilization
         self.shutdown_called = False
+        self.utilization_calls = 0
         self.nvmlMemory_v2 = "v2-marker"
 
     def nvmlInit(self):
@@ -77,9 +78,34 @@ class FakeNvml:
         return self._graphics
 
     def nvmlDeviceGetProcessUtilization(self, handle, timestamp):
+        self.utilization_calls += 1
         if self.fail_utilization:
             raise FakeNVMLError("not supported")
         return self._util
+
+
+class LegacyNvml:
+    """Simulates the old `pynvml` PyPI package: init/handle work, but modern
+    symbols (nvmlMemory_v2, *RunningProcesses_v3, ...) raise AttributeError."""
+
+    def nvmlInit(self):
+        pass
+
+    def nvmlShutdown(self):
+        pass
+
+    def nvmlDeviceGetHandleByIndex(self, index):
+        return f"handle-{index}"
+
+    def __getattr__(self, name):
+        raise AttributeError(name)
+
+
+class ExplodingNvml:
+    """Fails the test if ANY attribute is touched — proves NVML wasn't contacted."""
+
+    def __getattribute__(self, name):
+        raise AssertionError(f"NVML was touched: {name}")
 
 
 def test_nvml_memory_reports_v2_fields():
@@ -108,6 +134,8 @@ def test_nvml_memory_none_when_query_fails_but_still_shuts_down():
 
 
 def test_nvml_processes_merges_compute_and_graphics_dedup():
+    # PID 200: compute entry has size None (WDDM), graphics entry has a real
+    # size — the merge keeps kind "compute" but takes the first non-None size.
     fake = FakeNvml(
         compute_procs=[_Proc(100, 500 * 1024**2), _Proc(200, None)],
         graphics_procs=[_Proc(200, 300 * 1024**2), _Proc(300, 50 * 1024**2)],
@@ -115,7 +143,7 @@ def test_nvml_processes_merges_compute_and_graphics_dedup():
     result = nvml_mod.nvml_processes(nvml=fake)
     assert result == [
         {"pid": 100, "size_mb": 500, "kind": "compute"},
-        {"pid": 200, "size_mb": None, "kind": "compute"},
+        {"pid": 200, "size_mb": 300, "kind": "compute"},
         {"pid": 300, "size_mb": 50, "kind": "graphics"},
     ]
 
@@ -147,3 +175,45 @@ def test_nvml_busy_none_when_pid_not_in_samples():
 
 def test_nvml_busy_none_when_unavailable():
     assert nvml_mod.nvml_busy(111, nvml=FakeNvml(fail_init=True)) is None
+
+
+def test_nvml_busy_true_when_any_sample_positive_not_just_first():
+    # Zero sample first, positive later: ALL samples are considered.
+    fake = FakeNvml(util_samples=[_UtilSample(111, 0), _UtilSample(111, 40)])
+    assert nvml_mod.nvml_busy(111, nvml=fake) is True
+
+
+def test_nvml_busy_map_mixed_verdicts_in_one_fetch():
+    fake = FakeNvml(util_samples=[
+        _UtilSample(222, 0),   # zero sample first...
+        _UtilSample(111, 0),   # idle pid: sample exists, all zero
+        _UtilSample(222, 40),  # ...but a later positive sample makes 222 busy
+    ])
+    result = nvml_mod.nvml_busy_map([111, 222, 999], nvml=fake)
+    assert result == {111: False, 222: True, 999: None}
+    assert fake.utilization_calls == 1
+    assert fake.shutdown_called is True
+
+
+def test_nvml_busy_map_empty_pids_never_touches_nvml():
+    assert nvml_mod.nvml_busy_map([], nvml=ExplodingNvml()) == {}
+
+
+def test_nvml_busy_map_all_none_when_unavailable():
+    fake = FakeNvml(fail_init=True)
+    assert nvml_mod.nvml_busy_map([111, 222], nvml=fake) == {111: None, 222: None}
+
+
+def test_legacy_nvml_attribute_errors_degrade_to_defaults():
+    # Old `pynvml` PyPI package lacks nvmlMemory_v2 / *_v3 symbols: every
+    # public function must swallow the AttributeError and return its default.
+    assert nvml_mod.nvml_memory(nvml=LegacyNvml()) is None
+    assert nvml_mod.nvml_processes(nvml=LegacyNvml()) == []
+    assert nvml_mod.nvml_busy(111, nvml=LegacyNvml()) is None
+    assert nvml_mod.nvml_busy_map([111, 222], nvml=LegacyNvml()) == {111: None, 222: None}
+
+
+def test_b2mb_non_convertible_returns_none():
+    assert nvml_mod._b2mb("garbage") is None
+    assert nvml_mod._b2mb(None) is None
+    assert nvml_mod._b2mb(300 * 1024**2) == 300

@@ -2,8 +2,10 @@
 
 Pure module: the real ``pynvml`` (nvidia-ml-py) is injected as the ``nvml``
 parameter, defaulting to the real package, so tests never need a real GPU or
-driver. Every function degrades to ``None``/``[]`` on any ``nvml.NVMLError``
-(no driver, non-NVIDIA GPU, unsupported call) — never raises to the caller.
+driver. Every function degrades to ``None``/``[]``/``{}`` on ANY failure —
+not just ``NVMLError`` but also e.g. ``AttributeError`` from the legacy
+``pynvml`` PyPI package shadowing nvidia-ml-py (missing ``nvmlMemory_v2`` /
+``*RunningProcesses_v3``) — never raises to the caller.
 """
 
 from __future__ import annotations
@@ -13,35 +15,49 @@ from typing import Optional
 _BYTES_PER_MB = 1024 * 1024
 
 
+def _default_nvml():
+    """Resolve the default NVML implementation (the real ``pynvml`` package)."""
+    import pynvml
+
+    return pynvml
+
+
 def _b2mb(value) -> Optional[int]:
+    """Bytes -> whole MiB; ``None`` on ``None`` or any non-convertible value."""
     if value is None:
         return None
-    return int(value) // _BYTES_PER_MB
+    try:
+        return int(value) // _BYTES_PER_MB
+    except (TypeError, ValueError):
+        return None
 
 
 def _with_device(nvml, device_index, fn, default):
     """Init NVML, get the device handle, run ``fn(nvml, handle)``, always shut down.
 
-    Returns ``default`` on any ``nvml.NVMLError`` from init, handle lookup, or
-    ``fn`` itself.
+    Returns ``default`` on ANY exception from init, handle lookup, or ``fn``
+    itself. Swallowing broadly is deliberate and IS the module contract: this
+    is best-effort telemetry, and an injected implementation may raise
+    anything (e.g. ``AttributeError`` from the legacy ``pynvml`` package) —
+    nothing may escape to the caller.
     """
     try:
         nvml.nvmlInit()
-    except nvml.NVMLError:
+    except Exception:
         return default
     try:
         try:
             handle = nvml.nvmlDeviceGetHandleByIndex(device_index)
-        except nvml.NVMLError:
+        except Exception:
             return default
         try:
             return fn(nvml, handle)
-        except nvml.NVMLError:
+        except Exception:
             return default
     finally:
         try:
             nvml.nvmlShutdown()
-        except nvml.NVMLError:
+        except Exception:
             pass
 
 
@@ -55,7 +71,7 @@ def nvml_memory(device_index: int = 0, *, nvml=None) -> Optional[dict]:
     reserved memory.
     """
     if nvml is None:
-        import pynvml as nvml
+        nvml = _default_nvml()
 
     def _query(nvml, handle):
         mem = nvml.nvmlDeviceGetMemoryInfo(handle, nvml.nvmlMemory_v2)
@@ -77,53 +93,84 @@ def nvml_processes(device_index: int = 0, *, nvml=None) -> list[dict]:
     ``"graphics"``. ``size_mb`` is ``None`` when the driver doesn't report
     per-process memory (observed on Windows/WDDM — the PID/kind are still
     useful even without a size). A PID present in both lists is reported
-    once, tagged ``"compute"``. The compute and graphics queries fail
+    once, tagged ``"compute"``, with the first non-``None`` size from either
+    entry (a WDDM ``None`` in the compute list must not shadow a real size
+    in the graphics list). The compute and graphics queries fail
     independently — if one is unsupported, the other's results still come
     back. ``[]`` if NVML is unavailable entirely.
     """
     if nvml is None:
-        import pynvml as nvml
+        nvml = _default_nvml()
 
     def _query(nvml, handle):
         out: list[dict] = []
-        seen: set[int] = set()
+        by_pid: dict[int, dict] = {}
         try:
             compute = nvml.nvmlDeviceGetComputeRunningProcesses_v3(handle)
-        except nvml.NVMLError:
+        except Exception:
             compute = []
         for p in compute:
-            out.append({"pid": p.pid, "size_mb": _b2mb(p.usedGpuMemory), "kind": "compute"})
-            seen.add(p.pid)
+            entry = {"pid": p.pid, "size_mb": _b2mb(p.usedGpuMemory), "kind": "compute"}
+            out.append(entry)
+            by_pid[p.pid] = entry
         try:
             graphics = nvml.nvmlDeviceGetGraphicsRunningProcesses_v3(handle)
-        except nvml.NVMLError:
+        except Exception:
             graphics = []
         for p in graphics:
-            if p.pid in seen:
+            size = _b2mb(p.usedGpuMemory)
+            existing = by_pid.get(p.pid)
+            if existing is not None:
+                if existing["size_mb"] is None:
+                    existing["size_mb"] = size
                 continue
-            out.append({"pid": p.pid, "size_mb": _b2mb(p.usedGpuMemory), "kind": "graphics"})
+            out.append({"pid": p.pid, "size_mb": size, "kind": "graphics"})
         return out
 
     return _with_device(nvml, device_index, _query, [])
 
 
-def nvml_busy(pid: int, device_index: int = 0, *, nvml=None) -> Optional[bool]:
-    """Was ``pid`` doing GPU compute recently (windowed, not point-in-time)?
+def nvml_busy_map(pids, device_index: int = 0, *, nvml=None) -> dict:
+    """Busy signal for MANY pids in ONE NVML session + ONE utilization-buffer fetch.
+
+    Returns ``{pid: True|False|None}`` for every pid in ``pids``: ``True`` if
+    ANY sample in NVML's internal buffer for that pid has ``smUtil > 0``,
+    ``False`` if at least one sample exists but all are zero, ``None`` if the
+    pid has no sample at all or NVML is unavailable — never guesses ``False``
+    for a PID we simply have no data on. Empty ``pids`` returns ``{}``
+    without touching NVML.
 
     Uses ``nvmlDeviceGetProcessUtilization(handle, 0)`` — ``0`` returns every
     sample in NVML's own short internal buffer, not a single instant, so a
     brief idle gap between generated tokens doesn't read as "idle" the way a
-    single-shot snapshot could. Returns ``None`` (undetermined) if NVML is
-    unavailable, or if ``pid`` has no sample in the buffer at all — never
-    guesses ``False`` for a PID we simply have no data on.
+    single-shot snapshot could.
     """
+    pids = list(pids)
+    if not pids:
+        return {}
     if nvml is None:
-        import pynvml as nvml
+        nvml = _default_nvml()
 
     def _query(nvml, handle):
+        verdicts: dict = {pid: None for pid in pids}
+        wanted = set(pids)
         for s in nvml.nvmlDeviceGetProcessUtilization(handle, 0):
-            if s.pid == pid:
-                return s.smUtil > 0
-        return None
+            if s.pid not in wanted:
+                continue
+            if s.smUtil > 0:
+                verdicts[s.pid] = True
+            elif verdicts[s.pid] is None:
+                verdicts[s.pid] = False
+        return verdicts
 
-    return _with_device(nvml, device_index, _query, None)
+    return _with_device(nvml, device_index, _query, {pid: None for pid in pids})
+
+
+def nvml_busy(pid: int, device_index: int = 0, *, nvml=None) -> Optional[bool]:
+    """Was ``pid`` doing GPU compute recently (windowed, not point-in-time)?
+
+    Thin wrapper over :func:`nvml_busy_map` for a single pid — same semantics:
+    ``True`` if any buffered sample has ``smUtil > 0``, ``False`` if samples
+    exist but all zero, ``None`` if undetermined.
+    """
+    return nvml_busy_map([pid], device_index, nvml=nvml).get(pid)

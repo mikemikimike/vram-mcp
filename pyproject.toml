@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "vram-mcp"
-version = "0.1.0"
+version = "0.2.0"
 description = "MCP server to inspect and free NVIDIA GPU VRAM via Ollama + nvidia-smi."
 readme = "README.md"
 license = { file = "LICENSE" }

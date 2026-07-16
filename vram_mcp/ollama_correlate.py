@@ -1,15 +1,25 @@
-"""Map an Ollama model name to its ``llama-server`` runner PID.
+"""Map Ollama model tags to their ``llama-server`` runner PIDs.
 
 Ollama spawns one ``llama-server`` OS subprocess per loaded model but exposes
 no PID in its own API (``/api/ps`` has no ``pid`` field, confirmed against
-Ollama 0.31.1). The only correlation path: read the runner's ``--model
-<path>`` command-line argument (a blob file named ``sha256-<digest>``), then
-search Ollama's on-disk manifests for the one whose model-layer digest
-matches, which reveals the model's tag.
+Ollama 0.31.1). The only correlation path: scan the runner's command line for
+blob-file digests (files named ``sha256-<64 hex>``), then search Ollama's
+on-disk manifests for tags whose model-layer digest matches.
+
+Two real-world wrinkles this design absorbs:
+
+* A runner cmdline can contain **multiple** blob paths (``--model`` plus
+  ``--mmproj`` for multimodal), and paths can contain spaces/quoting. Rather
+  than parsing the ``--model`` argument, every sha256 digest found anywhere in
+  the cmdline is tried — only model-layer digests exist in manifests, so a
+  projector blob simply never matches.
+* One blob digest can belong to **multiple** tags (``ollama cp``, re-tags,
+  hf.co variants — verified live: 6 digest groups spanning 15 manifests). A
+  single manifest walk builds digest → {all tags}, so any alias resolves.
 
 This is inherently undocumented and version-dependent. Every function
-degrades to ``None`` on any parse/lookup failure rather than guessing, so a
-future Ollama layout change only turns a model's ``busy`` signal into
+degrades to ``None``/``{}`` on any parse/lookup failure rather than guessing,
+so a future Ollama layout change only turns a model's ``busy`` signal into
 "unknown," never breaks anything else.
 """
 
@@ -23,9 +33,9 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-_MODEL_FLAG_RE = re.compile(r"--model\s+(\S+)")
 _BLOB_DIGEST_RE = re.compile(r"sha256-([0-9a-f]{64})", re.IGNORECASE)
 _MODEL_LAYER_MEDIA_TYPE = "application/vnd.ollama.image.model"
+_OFFICIAL_REGISTRY = "registry.ollama.ai"
 
 
 def _default_manifests_root() -> Path:
@@ -35,16 +45,33 @@ def _default_manifests_root() -> Path:
     return Path.home() / ".ollama" / "models" / "manifests"
 
 
+def _parse_pid_cmdline_lines(lines: list[str]) -> list[dict]:
+    """Parse ``pid|cmdline`` lines (PowerShell CIM output) into process dicts."""
+    out = []
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        parts = line.split("|", 1)
+        if len(parts) != 2 or not parts[0].strip().isdigit():
+            continue
+        out.append({"pid": int(parts[0].strip()), "cmdline": parts[1].strip()})
+    return out
+
+
 def _list_llama_server_processes_windows(timeout: int = 5) -> list[dict]:
-    """``[{"pid": int, "cmdline": str}, ...]`` via one ``wmic`` call. ``[]`` on failure."""
+    """``[{"pid": int, "cmdline": str}, ...]`` via ``wmic``, falling back to
+    PowerShell CIM where wmic is absent (Windows 11 24H2+ fresh installs no
+    longer ship it). ``[]`` on any failure."""
     try:
         result = subprocess.run(
             ["wmic", "process", "where", "name='llama-server.exe'",
              "get", "ProcessId,CommandLine"],
             capture_output=True, text=True, timeout=timeout, check=True,
         )
-    except (FileNotFoundError, subprocess.TimeoutExpired,
-            subprocess.CalledProcessError, OSError):
+    except FileNotFoundError:
+        return _list_llama_server_processes_windows_cim(timeout)
+    except (subprocess.TimeoutExpired, subprocess.CalledProcessError, OSError):
         return []
     out = []
     lines = [ln.rstrip() for ln in result.stdout.splitlines() if ln.strip()]
@@ -54,6 +81,23 @@ def _list_llama_server_processes_windows(timeout: int = 5) -> list[dict]:
             continue
         out.append({"pid": int(parts[1]), "cmdline": parts[0].strip()})
     return out
+
+
+def _list_llama_server_processes_windows_cim(timeout: int = 5) -> list[dict]:
+    """wmic-free fallback via ``Get-CimInstance Win32_Process``. ``[]`` on failure."""
+    command = (
+        "Get-CimInstance Win32_Process -Filter \"Name='llama-server.exe'\" "
+        "| ForEach-Object { '{0}|{1}' -f $_.ProcessId, $_.CommandLine }"
+    )
+    try:
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", command],
+            capture_output=True, text=True, timeout=timeout, check=True,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired,
+            subprocess.CalledProcessError, OSError):
+        return []
+    return _parse_pid_cmdline_lines(result.stdout.splitlines())
 
 
 def _list_llama_server_processes_posix(timeout: int = 5) -> list[dict]:
@@ -84,52 +128,105 @@ def _list_llama_server_processes(timeout: int = 5) -> list[dict]:
     return _list_llama_server_processes_posix(timeout)
 
 
-def _extract_model_digest(cmdline: str) -> Optional[str]:
-    """Pull the sha256 hex digest out of a runner's ``--model <blob-path>`` arg.
+def _extract_blob_digests(cmdline: str) -> list[str]:
+    """Every sha256 blob digest found anywhere in a runner's command line.
 
-    Requires exactly 64 hex characters (a real sha256 digest) — a shorter or
-    malformed match is never accepted, so this never returns a partial guess.
+    Deliberately ignores argument structure (``--model``/``--mmproj``,
+    quoting, paths with spaces): only exact 64-hex digests are matched, and a
+    non-model digest simply never appears in a manifest's model layer, so
+    returning all of them is both simpler and immune to quoting issues.
+    Lowercased; order preserved; duplicates removed.
     """
-    m = _MODEL_FLAG_RE.search(cmdline)
-    if not m:
-        return None
-    blob_match = _BLOB_DIGEST_RE.search(m.group(1))
-    return blob_match.group(1).lower() if blob_match else None
+    seen: dict[str, None] = {}
+    for match in _BLOB_DIGEST_RE.findall(cmdline):
+        seen.setdefault(match.lower())
+    return list(seen)
 
 
-def _resolve_tag_for_digest(digest: str, manifests_root: Path) -> Optional[str]:
-    """Search every manifest file for one whose model layer matches ``digest``.
+def _tag_name_from_manifest_parts(registry_host: str, namespace: str,
+                                  name: str, tag: str) -> str:
+    """The tag name Ollama itself reports in ``/api/ps`` / ``/api/tags``.
+
+    * ``registry.ollama.ai`` + ``library`` → ``name:tag``
+    * ``registry.ollama.ai`` + other namespace → ``namespace/name:tag``
+    * any other registry host (e.g. ``hf.co``) → ``host/namespace/name:tag``
+    """
+    if registry_host == _OFFICIAL_REGISTRY:
+        if namespace == "library":
+            return f"{name}:{tag}"
+        return f"{namespace}/{name}:{tag}"
+    return f"{registry_host}/{namespace}/{name}:{tag}"
+
+
+def _digest_to_tags(manifests_root: Path) -> dict[str, set[str]]:
+    """One manifest-tree walk → model-layer digest → all tag names using it.
 
     A manifest's path relative to ``manifests_root`` is always
     ``<registry-host>/<namespace>/<name>/<tag>`` — Ollama's on-disk layout
-    (e.g. ``registry.ollama.ai/library/qwen3/8b``, verified live). The tag
-    reported is ``name:tag`` for the ``library`` namespace (matching
-    Ollama's own ``/api/ps`` naming), or ``namespace/name:tag`` otherwise.
-    A path that isn't exactly 4 levels deep is skipped, not guessed at.
+    (e.g. ``registry.ollama.ai/library/qwen3/8b``, ``hf.co/NousResearch/
+    Hermes-4.3-36B-GGUF/q4_K_M``, both verified live). A path that isn't
+    exactly 4 levels deep is skipped, not guessed at. ``{}`` on any failure.
     """
-    if not manifests_root.is_dir():
-        return None
-    target = f"sha256:{digest}"
-    for manifest_path in manifests_root.rglob("*"):
-        if not manifest_path.is_file():
-            continue
-        try:
-            doc = json.loads(manifest_path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            continue
-        layers = doc.get("layers", [])
-        match = any(
-            layer.get("mediaType") == _MODEL_LAYER_MEDIA_TYPE and layer.get("digest") == target
-            for layer in layers
-        )
-        if not match:
-            continue
-        rel = manifest_path.relative_to(manifests_root).parts
-        if len(rel) != 4:
-            continue
-        _registry_host, namespace, name, tag = rel
-        return f"{name}:{tag}" if namespace == "library" else f"{namespace}/{name}:{tag}"
-    return None
+    mapping: dict[str, set[str]] = {}
+    try:
+        if not manifests_root.is_dir():
+            return {}
+        for manifest_path in manifests_root.rglob("*"):
+            if not manifest_path.is_file():
+                continue
+            rel = manifest_path.relative_to(manifests_root).parts
+            if len(rel) != 4:
+                continue
+            try:
+                doc = json.loads(manifest_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            if not isinstance(doc, dict):
+                continue
+            layers = doc.get("layers", [])
+            if not isinstance(layers, list):
+                continue
+            tag_name = _tag_name_from_manifest_parts(*rel)
+            for layer in layers:
+                if not isinstance(layer, dict):
+                    continue
+                if layer.get("mediaType") != _MODEL_LAYER_MEDIA_TYPE:
+                    continue
+                digest = layer.get("digest")
+                if not isinstance(digest, str) or not digest.startswith("sha256:"):
+                    continue
+                hex_digest = digest[len("sha256:"):].lower()
+                mapping.setdefault(hex_digest, set()).add(tag_name)
+    except OSError:
+        return {}
+    return mapping
+
+
+def runner_pid_map(*, list_processes=None, manifests_root: Optional[Path] = None) -> dict[str, int]:
+    """Map every Ollama model tag currently served by a llama-server runner to that runner's PID.
+    ONE process listing + ONE manifest walk. A digest shared by several tags maps ALL those tags
+    to the runner's PID (any alias the caller asks about matches). {} on any failure."""
+    try:
+        list_processes = list_processes or _list_llama_server_processes
+        manifests_root = manifests_root or _default_manifests_root()
+        processes = list_processes()
+        if not processes:
+            return {}
+        digest_tags = _digest_to_tags(manifests_root)
+        if not digest_tags:
+            return {}
+        result: dict[str, int] = {}
+        for proc in processes:
+            pid = proc.get("pid")
+            cmdline = proc.get("cmdline")
+            if not isinstance(pid, int) or not isinstance(cmdline, str):
+                continue
+            for digest in _extract_blob_digests(cmdline):
+                for tag in digest_tags.get(digest, ()):
+                    result[tag] = pid
+        return result
+    except Exception:
+        return {}
 
 
 def find_pid_for_model(
@@ -139,15 +236,12 @@ def find_pid_for_model(
 ) -> Optional[int]:
     """The OS PID of the ``llama-server`` runner currently serving ``model_name``.
 
-    ``None`` if Ollama isn't running that model, or if correlation fails for
-    any reason (unexpected command-line shape, manifest missing/unparsable).
+    ``None`` if ``model_name`` is falsy, if Ollama isn't running that model,
+    or if correlation fails for any reason (unexpected command-line shape,
+    manifest missing/unparsable).
     """
-    list_processes = list_processes or _list_llama_server_processes
-    manifests_root = manifests_root or _default_manifests_root()
-    for proc in list_processes():
-        digest = _extract_model_digest(proc["cmdline"])
-        if not digest:
-            continue
-        if _resolve_tag_for_digest(digest, manifests_root) == model_name:
-            return proc["pid"]
-    return None
+    if not model_name:
+        return None
+    return runner_pid_map(
+        list_processes=list_processes, manifests_root=manifests_root
+    ).get(model_name)

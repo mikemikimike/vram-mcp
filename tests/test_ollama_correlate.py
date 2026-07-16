@@ -5,12 +5,14 @@ import json
 from vram_mcp import ollama_correlate as oc
 
 _REAL_DIGEST = "a3de86cd1c132c822487ededd47a324c50491393e6565cd14bafa40d0b8e686f"
+_MMPROJ_DIGEST = "c" * 64
 
 
 def _write_manifest(manifests_root, registry_host, namespace, name, tag, model_digest):
     """Write a manifest at the REAL Ollama on-disk depth:
     <manifests_root>/<registry_host>/<namespace>/<name>/<tag>
-    (verified live: registry.ollama.ai/library/gemma3/27b)."""
+    (verified live: registry.ollama.ai/library/gemma3/27b and
+    hf.co/NousResearch/Hermes-4.3-36B-GGUF/q4_K_M)."""
     path = manifests_root / registry_host / namespace / name / tag
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps({
@@ -24,47 +26,99 @@ def _write_manifest(manifests_root, registry_host, namespace, name, tag, model_d
     }))
 
 
-def test_extract_model_digest_from_real_cmdline():
+# ---------------------------------------------------------------- digests
+
+
+def test_extract_blob_digests_from_real_cmdline():
     cmdline = (
         r"C:\Ollama\llama-server.exe --model "
         rf"C:\Users\x\.ollama\models\blobs\sha256-{_REAL_DIGEST} --port 12288"
     )
-    assert oc._extract_model_digest(cmdline) == _REAL_DIGEST
+    assert oc._extract_blob_digests(cmdline) == [_REAL_DIGEST]
 
 
-def test_extract_model_digest_missing_flag_returns_none():
-    assert oc._extract_model_digest("llama-server.exe --port 12288") is None
+def test_extract_blob_digests_quoted_spaced_path():
+    # A username with a space plus shell quoting must not truncate the digest.
+    cmdline = (
+        r'"C:\Program Files\Ollama\llama-server.exe" --model '
+        rf'"C:\Users\John Smith\.ollama\models\blobs\sha256-{_REAL_DIGEST}" --port 1'
+    )
+    assert oc._extract_blob_digests(cmdline) == [_REAL_DIGEST]
 
 
-def test_extract_model_digest_short_hash_not_matched():
-    # A malformed/truncated digest (not 64 hex chars) is never extracted --
+def test_extract_blob_digests_multiple_blobs_multimodal():
+    # --model plus --mmproj (multimodal runner) → both digests returned, in order.
+    cmdline = (
+        rf"llama-server.exe --model C:\x\blobs\sha256-{_REAL_DIGEST} "
+        rf"--mmproj C:\x\blobs\sha256-{_MMPROJ_DIGEST} --port 1"
+    )
+    assert oc._extract_blob_digests(cmdline) == [_REAL_DIGEST, _MMPROJ_DIGEST]
+
+
+def test_extract_blob_digests_lowercases_and_dedupes():
+    upper = _REAL_DIGEST.upper()
+    cmdline = rf"exe --model /a/sha256-{upper} --draft /b/sha256-{_REAL_DIGEST}"
+    assert oc._extract_blob_digests(cmdline) == [_REAL_DIGEST]
+
+
+def test_extract_blob_digests_none_found():
+    assert oc._extract_blob_digests("llama-server.exe --port 12288") == []
+
+
+def test_extract_blob_digests_short_hash_not_matched():
+    # A malformed/truncated digest (not 64 hex chars) is never extracted —
     # never guess a partial match.
-    assert oc._extract_model_digest("llama-server.exe --model /x/sha256-abc123") is None
+    assert oc._extract_blob_digests("llama-server.exe --model /x/sha256-abc123") == []
 
 
-def test_resolve_tag_for_digest_library_namespace(tmp_path):
+# ---------------------------------------------------------- digest → tags
+
+
+def test_digest_to_tags_library_namespace(tmp_path):
     manifests = tmp_path / "manifests"
     _write_manifest(manifests, "registry.ollama.ai", "library", "qwen3", "8b", "abc123")
-    assert oc._resolve_tag_for_digest("abc123", manifests) == "qwen3:8b"
+    assert oc._digest_to_tags(manifests) == {"abc123": {"qwen3:8b"}}
 
 
-def test_resolve_tag_for_digest_non_library_namespace(tmp_path):
+def test_digest_to_tags_non_library_namespace(tmp_path):
     manifests = tmp_path / "manifests"
     _write_manifest(manifests, "registry.ollama.ai", "someuser", "mymodel", "latest", "abc123")
-    assert oc._resolve_tag_for_digest("abc123", manifests) == "someuser/mymodel:latest"
+    assert oc._digest_to_tags(manifests) == {"abc123": {"someuser/mymodel:latest"}}
 
 
-def test_resolve_tag_for_digest_no_match_returns_none(tmp_path):
+def test_digest_to_tags_hf_co_host_preserved(tmp_path):
+    # Any non-official registry host keeps the host in the tag name,
+    # matching Ollama's /api/ps naming (verified against real hf.co manifests).
     manifests = tmp_path / "manifests"
-    _write_manifest(manifests, "registry.ollama.ai", "library", "qwen3", "8b", "abc123")
-    assert oc._resolve_tag_for_digest("nonexistent", manifests) is None
+    _write_manifest(manifests, "hf.co", "NousResearch",
+                    "Hermes-4.3-36B-GGUF", "q4_K_M", "abc123")
+    assert oc._digest_to_tags(manifests) == {
+        "abc123": {"hf.co/NousResearch/Hermes-4.3-36B-GGUF:q4_K_M"},
+    }
 
 
-def test_resolve_tag_for_digest_missing_dir_returns_none(tmp_path):
-    assert oc._resolve_tag_for_digest("abc123", tmp_path / "nope") is None
+def test_digest_to_tags_shared_digest_multimap(tmp_path):
+    # One blob shared by several tags (ollama cp / re-tags / hf.co variants):
+    # ALL tag names must appear under the same digest.
+    manifests = tmp_path / "manifests"
+    _write_manifest(manifests, "registry.ollama.ai", "library",
+                    "hermes-4.3-36b-q4km-32k", "latest", _REAL_DIGEST)
+    _write_manifest(manifests, "hf.co", "NousResearch",
+                    "Hermes-4.3-36B-GGUF", "q4_K_M", _REAL_DIGEST)
+    _write_manifest(manifests, "registry.ollama.ai", "library",
+                    "qwen3", "8b", "other000")
+    assert oc._digest_to_tags(manifests) == {
+        _REAL_DIGEST: {"hermes-4.3-36b-q4km-32k:latest",
+                       "hf.co/NousResearch/Hermes-4.3-36B-GGUF:q4_K_M"},
+        "other000": {"qwen3:8b"},
+    }
 
 
-def test_resolve_tag_for_digest_wrong_depth_skipped(tmp_path):
+def test_digest_to_tags_missing_dir_returns_empty(tmp_path):
+    assert oc._digest_to_tags(tmp_path / "nope") == {}
+
+
+def test_digest_to_tags_wrong_depth_skipped(tmp_path):
     # A manifest-shaped file at the WRONG depth (3 levels, missing the
     # registry-host segment) is skipped, not guessed at.
     manifests = tmp_path / "manifests"
@@ -74,7 +128,113 @@ def test_resolve_tag_for_digest_wrong_depth_skipped(tmp_path):
         "layers": [{"mediaType": "application/vnd.ollama.image.model",
                     "digest": "sha256:abc123"}],
     }))
-    assert oc._resolve_tag_for_digest("abc123", manifests) is None
+    assert oc._digest_to_tags(manifests) == {}
+
+
+def test_digest_to_tags_unparsable_manifest_skipped(tmp_path):
+    manifests = tmp_path / "manifests"
+    _write_manifest(manifests, "registry.ollama.ai", "library", "qwen3", "8b", "abc123")
+    bad = manifests / "registry.ollama.ai" / "library" / "broken" / "latest"
+    bad.parent.mkdir(parents=True, exist_ok=True)
+    bad.write_text("not json {")
+    assert oc._digest_to_tags(manifests) == {"abc123": {"qwen3:8b"}}
+
+
+# ------------------------------------------------------------ pid mapping
+
+
+def test_runner_pid_map_end_to_end_shared_digest(tmp_path):
+    # One runner serving a digest shared by 2 tags → BOTH tags map to the pid.
+    manifests = tmp_path / "manifests"
+    _write_manifest(manifests, "registry.ollama.ai", "library",
+                    "hermes-4.3-36b-q4km-32k", "latest", _REAL_DIGEST)
+    _write_manifest(manifests, "hf.co", "NousResearch",
+                    "Hermes-4.3-36B-GGUF", "q4_K_M", _REAL_DIGEST)
+
+    def fake_list_processes():
+        return [{"pid": 43176, "cmdline":
+                 rf"llama-server.exe --model C:\x\blobs\sha256-{_REAL_DIGEST} --port 1"}]
+
+    assert oc.runner_pid_map(
+        list_processes=fake_list_processes, manifests_root=manifests
+    ) == {
+        "hermes-4.3-36b-q4km-32k:latest": 43176,
+        "hf.co/NousResearch/Hermes-4.3-36B-GGUF:q4_K_M": 43176,
+    }
+
+
+def test_runner_pid_map_multiple_runners(tmp_path):
+    manifests = tmp_path / "manifests"
+    digest_a, digest_b = "a" * 64, "b" * 64
+    _write_manifest(manifests, "registry.ollama.ai", "library", "qwen3", "8b", digest_a)
+    _write_manifest(manifests, "registry.ollama.ai", "library", "gemma3", "27b", digest_b)
+
+    def fake_list_processes():
+        return [
+            {"pid": 111, "cmdline": rf"llama-server.exe --model /b/sha256-{digest_a}"},
+            {"pid": 222, "cmdline": rf"llama-server.exe --model /b/sha256-{digest_b}"},
+        ]
+
+    assert oc.runner_pid_map(
+        list_processes=fake_list_processes, manifests_root=manifests
+    ) == {"qwen3:8b": 111, "gemma3:27b": 222}
+
+
+def test_runner_pid_map_mmproj_digest_ignored(tmp_path):
+    # A projector blob digest has no model-layer manifest entry, so it
+    # never matches — only the model tag appears.
+    manifests = tmp_path / "manifests"
+    _write_manifest(manifests, "registry.ollama.ai", "library", "gemma3", "27b", _REAL_DIGEST)
+
+    def fake_list_processes():
+        return [{"pid": 7, "cmdline": (
+            rf"llama-server.exe --model C:\x\blobs\sha256-{_REAL_DIGEST} "
+            rf"--mmproj C:\x\blobs\sha256-{_MMPROJ_DIGEST}")}]
+
+    assert oc.runner_pid_map(
+        list_processes=fake_list_processes, manifests_root=manifests
+    ) == {"gemma3:27b": 7}
+
+
+def test_runner_pid_map_no_processes_returns_empty(tmp_path):
+    manifests = tmp_path / "manifests"
+    _write_manifest(manifests, "registry.ollama.ai", "library", "qwen3", "8b", _REAL_DIGEST)
+    assert oc.runner_pid_map(list_processes=lambda: [], manifests_root=manifests) == {}
+
+
+def test_runner_pid_map_missing_manifests_returns_empty(tmp_path):
+    def fake_list_processes():
+        return [{"pid": 1, "cmdline": rf"exe --model /b/sha256-{_REAL_DIGEST}"}]
+
+    assert oc.runner_pid_map(
+        list_processes=fake_list_processes, manifests_root=tmp_path / "nope"
+    ) == {}
+
+
+def test_runner_pid_map_list_processes_raises_returns_empty(tmp_path):
+    def boom():
+        raise RuntimeError("ps exploded")
+
+    assert oc.runner_pid_map(list_processes=boom, manifests_root=tmp_path) == {}
+
+
+def test_runner_pid_map_malformed_process_entries_skipped(tmp_path):
+    manifests = tmp_path / "manifests"
+    _write_manifest(manifests, "registry.ollama.ai", "library", "qwen3", "8b", _REAL_DIGEST)
+
+    def fake_list_processes():
+        return [
+            {"pid": "not-an-int", "cmdline": rf"exe --model /b/sha256-{_REAL_DIGEST}"},
+            {"pid": 5},  # missing cmdline
+            {"pid": 9, "cmdline": rf"exe --model /b/sha256-{_REAL_DIGEST}"},
+        ]
+
+    assert oc.runner_pid_map(
+        list_processes=fake_list_processes, manifests_root=manifests
+    ) == {"qwen3:8b": 9}
+
+
+# ------------------------------------------------------ find_pid_for_model
 
 
 def test_find_pid_for_model_matches_correlated_tag(tmp_path):
@@ -89,6 +249,57 @@ def test_find_pid_for_model_matches_correlated_tag(tmp_path):
         "qwen3:8b", list_processes=fake_list_processes, manifests_root=manifests
     )
     assert pid == 43176
+
+
+def test_find_pid_for_model_spaced_quoted_path(tmp_path):
+    # The original --model\s+(\S+) regex truncated at the first space in a
+    # quoted path; digest-anywhere extraction must survive it.
+    manifests = tmp_path / "manifests"
+    _write_manifest(manifests, "registry.ollama.ai", "library", "qwen3", "8b", _REAL_DIGEST)
+
+    def fake_list_processes():
+        return [{"pid": 314, "cmdline": (
+            r'"C:\Program Files\Ollama\llama-server.exe" --model '
+            rf'"C:\Users\John Smith\.ollama\models\blobs\sha256-{_REAL_DIGEST}" --port 1')}]
+
+    pid = oc.find_pid_for_model(
+        "qwen3:8b", list_processes=fake_list_processes, manifests_root=manifests
+    )
+    assert pid == 314
+
+
+def test_find_pid_for_model_every_alias_matches(tmp_path):
+    manifests = tmp_path / "manifests"
+    _write_manifest(manifests, "registry.ollama.ai", "library",
+                    "hermes-4.3-36b-q4km-32k", "latest", _REAL_DIGEST)
+    _write_manifest(manifests, "hf.co", "NousResearch",
+                    "Hermes-4.3-36B-GGUF", "q4_K_M", _REAL_DIGEST)
+
+    def fake_list_processes():
+        return [{"pid": 999, "cmdline":
+                 rf"llama-server.exe --model /b/sha256-{_REAL_DIGEST}"}]
+
+    for alias in ("hermes-4.3-36b-q4km-32k:latest",
+                  "hf.co/NousResearch/Hermes-4.3-36B-GGUF:q4_K_M"):
+        assert oc.find_pid_for_model(
+            alias, list_processes=fake_list_processes, manifests_root=manifests
+        ) == 999
+
+
+def test_find_pid_for_model_none_name_returns_none(tmp_path):
+    # Guard: a falsy model name never false-matches, even when a runner's
+    # digest fails to resolve to any tag.
+    manifests = tmp_path / "manifests"  # empty → digest resolves to nothing
+
+    def fake_list_processes():
+        return [{"pid": 1, "cmdline": rf"exe --model /b/sha256-{_REAL_DIGEST}"}]
+
+    assert oc.find_pid_for_model(
+        None, list_processes=fake_list_processes, manifests_root=manifests
+    ) is None
+    assert oc.find_pid_for_model(
+        "", list_processes=fake_list_processes, manifests_root=manifests
+    ) is None
 
 
 def test_find_pid_for_model_no_matching_process_returns_none(tmp_path):
@@ -113,3 +324,60 @@ def test_find_pid_for_model_digest_mismatch_returns_none(tmp_path):
         "qwen3:8b", list_processes=fake_list_processes, manifests_root=manifests
     )
     assert pid is None
+
+
+# ------------------------------------------------- windows process parsing
+
+
+def test_parse_pid_cmdline_lines_cim_format():
+    lines = [
+        rf"43176|C:\Ollama\llama-server.exe --model C:\x\blobs\sha256-{_REAL_DIGEST}",
+        "",
+        "garbage-without-pipe",
+        "notanumber|exe --model x",
+    ]
+    assert oc._parse_pid_cmdline_lines(lines) == [
+        {"pid": 43176,
+         "cmdline": rf"C:\Ollama\llama-server.exe --model C:\x\blobs\sha256-{_REAL_DIGEST}"},
+    ]
+
+
+def test_windows_wmic_missing_falls_back_to_cim(monkeypatch):
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd[0])
+        if cmd[0] == "wmic":
+            raise FileNotFoundError("wmic gone on 24H2")
+
+        class R:
+            stdout = rf"7|llama-server.exe --model /b/sha256-{_REAL_DIGEST}"
+        return R()
+
+    monkeypatch.setattr(oc.subprocess, "run", fake_run)
+    procs = oc._list_llama_server_processes_windows()
+    assert calls == ["wmic", "powershell"]
+    assert procs == [{"pid": 7,
+                      "cmdline": rf"llama-server.exe --model /b/sha256-{_REAL_DIGEST}"}]
+
+
+def test_windows_wmic_and_cim_both_missing_returns_empty(monkeypatch):
+    def fake_run(cmd, **kwargs):
+        raise FileNotFoundError(cmd[0])
+
+    monkeypatch.setattr(oc.subprocess, "run", fake_run)
+    assert oc._list_llama_server_processes_windows() == []
+
+
+def test_windows_wmic_other_failure_returns_empty_without_fallback(monkeypatch):
+    # A timeout/nonzero-exit from wmic still swallows to [] (only absence
+    # triggers the CIM fallback).
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd[0])
+        raise oc.subprocess.CalledProcessError(1, cmd)
+
+    monkeypatch.setattr(oc.subprocess, "run", fake_run)
+    assert oc._list_llama_server_processes_windows() == []
+    assert calls == ["wmic"]

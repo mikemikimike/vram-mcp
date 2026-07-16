@@ -191,6 +191,17 @@ def test_combined_status_full_wiring():
     assert status["other_processes"] == [{"pid": 999, "size_mb": 100, "kind": "graphics"}]
 
 
+def test_combined_status_skips_snapshot_when_nothing_loaded():
+    """An idle-status call must not pay the snapshot's subprocess/IO cost."""
+    def exploding_snapshot():
+        raise AssertionError("snapshot must not be captured for zero models")
+
+    status = core.combined_status(
+        gpu_fn_const(8000), FakeOllama([]), snapshot_fn=exploding_snapshot,
+    )
+    assert status["loaded"] == []
+
+
 # ---- ensure_free ------------------------------------------------------------
 
 def test_ensure_free_already_free_short_circuits():
@@ -370,6 +381,19 @@ def test_ensure_free_protection_noop_when_snapshot_not_provided():
     result = core.ensure_free(8, gpu_fn, ollama, sleep=lambda *_: None)
     assert ollama.unloaded == ["a"]
     assert result["declined"] == []
+
+
+def test_ensure_free_skips_snapshot_when_no_models_to_evict():
+    """Target unreachable with zero loaded models: no snapshot is captured."""
+    def exploding_snapshot():
+        raise AssertionError("snapshot must not be captured for zero models")
+
+    result = core.ensure_free(
+        8, gpu_fn_const(1000), FakeOllama([]), sleep=lambda *_: None,
+        snapshot_fn=exploding_snapshot,
+    )
+    assert result["ok"] is False
+    assert result["unloaded"] == []
 
 
 def test_ensure_free_no_settle_sleep_when_unload_fails():

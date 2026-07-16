@@ -87,7 +87,13 @@ async def vram_status() -> dict:
 
 
 def _list_loaded_impl() -> dict:
-    loaded = _full_status()["loaded"]
+    # Slimmer than _full_status: this tool returns only the model list, so
+    # skip the nvidia-smi spawn and the NVML process survey whose results
+    # would be discarded.
+    status = core.combined_status(
+        lambda: [], _ollama, snapshot_fn=_snapshot,
+    )
+    loaded = status["loaded"]
     return {
         "loaded": loaded,
         "summary": f"{len(loaded)} model(s) loaded.",
@@ -106,15 +112,22 @@ def _unload_impl(model: str, force: bool) -> dict:
     if not force:
         protected, detail = core.is_protected(model, _snapshot())
         if protected:
+            summary = (
+                f"'{model}' is protected (claimed or busy); "
+                "pass force=True to override."
+            )
+            if detail["busy"] is True and not detail["claims"]:
+                summary += (
+                    " Note: busy reflects recent GPU activity and can lag a"
+                    " few seconds after a generation ends — if the work you"
+                    " know about has finished, force=True is safe."
+                )
             return {
                 "ok": False,
                 "model": model,
                 "protected": True,
                 **detail,
-                "summary": (
-                    f"'{model}' is protected (claimed or busy); "
-                    "pass force=True to override."
-                ),
+                "summary": summary,
             }
     ok = _ollama.unload(model)
     return {
@@ -131,7 +144,9 @@ async def unload(model: str, force: bool = False) -> dict:
     """Evict a single model from VRAM now (Ollama ``keep_alive=0``).
 
     Refuses by default if ``model`` has an active claim or a best-effort
-    ``busy`` signal — pass ``force=True`` to override.
+    ``busy`` signal — pass ``force=True`` to override. Note the busy signal
+    is windowed: it can read True for a few seconds after a generation ends,
+    so ``force=True`` is the intended path when you know the work is done.
     """
     return await _in_thread(_unload_impl, model, force)
 
@@ -141,26 +156,25 @@ def _ensure_free_impl(gb: float, force: bool) -> dict:
         gb, gpu_status, _ollama, settle=0.5, force=force,
         snapshot_fn=_snapshot,
     )
+    if result["already_free"]:
+        base = f"Already {_fmt_free(result['free_mb'])} free (target {gb} GB)."
+    elif result["ok"]:
+        base = (
+            f"Freed VRAM to {_fmt_free(result['free_mb'])} "
+            f"(target {gb} GB) by unloading: "
+            f"{', '.join(result['unloaded']) or 'none'}."
+        )
+    else:
+        base = (
+            f"Could not reach {gb} GB free "
+            f"(now {_fmt_free(result['free_mb'])}); "
+            f"unloaded: {', '.join(result['unloaded']) or 'none'}."
+        )
     declined_note = ""
     if result["declined"]:
         names = ", ".join(d["name"] for d in result["declined"])
         declined_note = f" Protected (force=True to override): {names}."
-    if result["already_free"]:
-        result["summary"] = (
-            f"Already {_fmt_free(result['free_mb'])} free (target {gb} GB)."
-        )
-    elif result["ok"]:
-        result["summary"] = (
-            f"Freed VRAM to {_fmt_free(result['free_mb'])} "
-            f"(target {gb} GB) by unloading: "
-            f"{', '.join(result['unloaded']) or 'none'}."
-        ) + declined_note
-    else:
-        result["summary"] = (
-            f"Could not reach {gb} GB free "
-            f"(now {_fmt_free(result['free_mb'])}); "
-            f"unloaded: {', '.join(result['unloaded']) or 'none'}."
-        ) + declined_note
+    result["summary"] = base + declined_note
     return result
 
 
@@ -169,9 +183,10 @@ async def ensure_free(gb: float, force: bool = False) -> dict:
     """Free VRAM until at least ``gb`` gigabytes are available.
 
     Unloads resident models largest-first until the target is met, skipping
-    claimed/busy models by default (``force=True`` to override). Returns
-    which models were unloaded, which were declined (protected), and whether
-    the target was reached.
+    claimed/busy models by default (``force=True`` to override; busy is a
+    windowed signal that can lag a few seconds past the end of a generation).
+    Returns which models were unloaded, which were declined (protected), and
+    whether the target was reached.
     """
     return await _in_thread(_ensure_free_impl, gb, force)
 
@@ -203,11 +218,24 @@ async def warm(model: str, keep_alive: str = "5m") -> dict:
 # operational outcomes, not bugs — surface them as structured {ok: false}
 # responses instead of raw tracebacks.
 
-def _claim_impl(model: str, owner: str, purpose: str, ttl_seconds: int) -> dict:
+def _ledger_call(verb: str, fn, *args) -> dict:
+    """Run a ledger write with the shared failure policy in one place.
+
+    Returns ``{"result": <fn's return>}`` on success, or ``{"error": {ok:
+    false, summary}}`` on an OPERATIONAL failure (live-lock timeout,
+    exhausted Windows sharing-violation retries) so every claim tool
+    degrades identically instead of surfacing a raw traceback."""
     try:
-        result = _claims.claim(model, owner, purpose, ttl_seconds)
+        return {"result": fn(*args)}
     except (TimeoutError, OSError) as e:
-        return {"ok": False, "summary": f"Claim failed: {e}"}
+        return {"error": {"ok": False, "summary": f"{verb} failed: {e}"}}
+
+
+def _claim_impl(model: str, owner: str, purpose: str, ttl_seconds: int) -> dict:
+    outcome = _ledger_call("Claim", _claims.claim, model, owner, purpose, ttl_seconds)
+    if "error" in outcome:
+        return outcome["error"]
+    result = outcome["result"]
     result["ok"] = True
     result["summary"] = (
         f"Claimed '{model}' for {owner} ({purpose}), expires {result['expires_at']}."
@@ -228,10 +256,10 @@ async def claim(model: str, owner: str, purpose: str, ttl_seconds: int = 3600) -
 
 
 def _renew_impl(claim_id: str, ttl_seconds: Optional[int]) -> dict:
-    try:
-        result = _claims.renew(claim_id, ttl_seconds)
-    except (TimeoutError, OSError) as e:
-        return {"ok": False, "summary": f"Renew failed: {e}"}
+    outcome = _ledger_call("Renew", _claims.renew, claim_id, ttl_seconds)
+    if "error" in outcome:
+        return outcome["error"]
+    result = outcome["result"]
     result["summary"] = (
         f"Renewed, expires {result['expires_at']}." if result["ok"]
         else "No such claim (already expired or released?)."
@@ -246,10 +274,10 @@ async def renew(claim_id: str, ttl_seconds: Optional[int] = None) -> dict:
 
 
 def _release_impl(claim_id: str) -> dict:
-    try:
-        result = _claims.release(claim_id)
-    except (TimeoutError, OSError) as e:
-        return {"ok": False, "summary": f"Release failed: {e}"}
+    outcome = _ledger_call("Release", _claims.release, claim_id)
+    if "error" in outcome:
+        return outcome["error"]
+    result = outcome["result"]
     result["summary"] = "Released." if result["ok"] else "No such claim."
     return result
 

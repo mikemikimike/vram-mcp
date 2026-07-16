@@ -6,6 +6,11 @@ import pytest
 
 from vram_mcp import claims
 
+# Shared test epoch: every test pins the clock here (in the past relative to
+# wall time — which is exactly why write paths must honor now_fn, never the
+# real clock, or wall-clock pruning would eat these fixtures).
+_T0 = datetime(2026, 7, 13, 18, 0, 0, tzinfo=timezone.utc)
+
 
 def _clock(start):
     """A controllable now_fn: starts at `start`, advances via .tick(seconds)."""
@@ -23,7 +28,7 @@ def _clock(start):
 
 def test_claim_creates_and_list_claims_returns_it(tmp_path):
     path = tmp_path / "claims.json"
-    now_fn = _clock(datetime(2026, 7, 13, 18, 0, 0, tzinfo=timezone.utc))
+    now_fn = _clock(_T0)
     result = claims.claim("llama3.2", "project-a", "narration",
                           ttl_seconds=3600, path=path, now_fn=now_fn)
     assert "claim_id" in result
@@ -38,7 +43,7 @@ def test_claim_creates_and_list_claims_returns_it(tmp_path):
 
 def test_list_claims_filters_by_model(tmp_path):
     path = tmp_path / "claims.json"
-    now_fn = _clock(datetime(2026, 7, 13, 18, 0, 0, tzinfo=timezone.utc))
+    now_fn = _clock(_T0)
     claims.claim("llama3.2", "a", "x", path=path, now_fn=now_fn)
     claims.claim("qwen3:8b", "b", "y", path=path, now_fn=now_fn)
 
@@ -50,7 +55,7 @@ def test_list_claims_filters_by_model(tmp_path):
 
 def test_claim_expires_after_ttl(tmp_path):
     path = tmp_path / "claims.json"
-    now_fn = _clock(datetime(2026, 7, 13, 18, 0, 0, tzinfo=timezone.utc))
+    now_fn = _clock(_T0)
     claims.claim("llama3.2", "a", "x", ttl_seconds=60, path=path, now_fn=now_fn)
 
     now_fn.tick(30)
@@ -62,7 +67,7 @@ def test_claim_expires_after_ttl(tmp_path):
 
 def test_renew_extends_expiry_with_original_ttl(tmp_path):
     path = tmp_path / "claims.json"
-    now_fn = _clock(datetime(2026, 7, 13, 18, 0, 0, tzinfo=timezone.utc))
+    now_fn = _clock(_T0)
     created = claims.claim("llama3.2", "a", "x", ttl_seconds=60, path=path, now_fn=now_fn)
 
     now_fn.tick(50)
@@ -76,7 +81,7 @@ def test_renew_extends_expiry_with_original_ttl(tmp_path):
 
 def test_renew_with_new_ttl_overrides(tmp_path):
     path = tmp_path / "claims.json"
-    now_fn = _clock(datetime(2026, 7, 13, 18, 0, 0, tzinfo=timezone.utc))
+    now_fn = _clock(_T0)
     created = claims.claim("llama3.2", "a", "x", ttl_seconds=60, path=path, now_fn=now_fn)
     result = claims.renew(created["claim_id"], ttl_seconds=7200, path=path, now_fn=now_fn)
     assert result["expires_at"] == "2026-07-13T20:00:00Z"
@@ -89,7 +94,7 @@ def test_renew_unknown_claim_id_returns_not_ok(tmp_path):
 
 def test_release_removes_claim(tmp_path):
     path = tmp_path / "claims.json"
-    now_fn = _clock(datetime(2026, 7, 13, 18, 0, 0, tzinfo=timezone.utc))
+    now_fn = _clock(_T0)
     created = claims.claim("llama3.2", "a", "x", path=path, now_fn=now_fn)
     assert claims.release(created["claim_id"], path=path) == {"ok": True}
     assert claims.list_claims(path=path, now_fn=now_fn) == []
@@ -102,7 +107,7 @@ def test_release_unknown_claim_id_returns_not_ok(tmp_path):
 
 def test_multiple_claims_same_model_independent(tmp_path):
     path = tmp_path / "claims.json"
-    now_fn = _clock(datetime(2026, 7, 13, 18, 0, 0, tzinfo=timezone.utc))
+    now_fn = _clock(_T0)
     claims.claim("llama3.2", "session-a", "reason-a", path=path, now_fn=now_fn)
     claims.claim("llama3.2", "session-b", "reason-b", path=path, now_fn=now_fn)
     active = claims.list_claims("llama3.2", path=path, now_fn=now_fn)
@@ -113,7 +118,7 @@ def test_sequential_claims_both_persist(tmp_path):
     """Each claim()/release() call round-trips through the lock cleanly --
     a stale lock from a prior call never blocks the next one."""
     path = tmp_path / "claims.json"
-    now_fn = _clock(datetime(2026, 7, 13, 18, 0, 0, tzinfo=timezone.utc))
+    now_fn = _clock(_T0)
     claims.claim("a", "x", "p", path=path, now_fn=now_fn)
     claims.claim("b", "y", "p", path=path, now_fn=now_fn)
     assert len(claims.list_claims(path=path, now_fn=now_fn)) == 2
@@ -147,7 +152,7 @@ def test_stale_lock_is_broken_and_claim_succeeds(tmp_path):
     old = time.time() - (claims._LOCK_STALE_SECONDS + 30)
     os.utime(lock_path, (old, old))
 
-    now_fn = _clock(datetime(2026, 7, 13, 18, 0, 0, tzinfo=timezone.utc))
+    now_fn = _clock(_T0)
     result = claims.claim("llama3.2", "a", "x", path=path, now_fn=now_fn)
     assert "claim_id" in result
     assert len(claims.list_claims(path=path, now_fn=now_fn)) == 1
@@ -204,7 +209,7 @@ def test_save_retries_replace_on_permission_error_then_succeeds(tmp_path, monkey
         return real_replace(src, dst)
 
     monkeypatch.setattr(claims.os, "replace", flaky_replace)
-    now_fn = _clock(datetime(2026, 7, 13, 18, 0, 0, tzinfo=timezone.utc))
+    now_fn = _clock(_T0)
     result = claims.claim("llama3.2", "a", "x", path=tmp_path / "claims.json",
                           now_fn=now_fn)
     assert "claim_id" in result
@@ -220,7 +225,7 @@ def test_save_gives_up_after_retries_and_cleans_tmp(tmp_path, monkeypatch):
         raise PermissionError(13, "The process cannot access the file")
 
     monkeypatch.setattr(claims.os, "replace", always_fails)
-    now_fn = _clock(datetime(2026, 7, 13, 18, 0, 0, tzinfo=timezone.utc))
+    now_fn = _clock(_T0)
     with pytest.raises(PermissionError):
         claims.claim("llama3.2", "a", "x", path=path, now_fn=now_fn)
     assert not path.with_suffix(path.suffix + ".tmp").exists()
@@ -245,7 +250,7 @@ def test_malformed_records_are_skipped_not_fatal(tmp_path):
         good, bad_missing_key, bad_unparsable, bad_naive_dt, bad_not_a_dict,
     ]}), encoding="utf-8")
 
-    now_fn = _clock(datetime(2026, 7, 13, 18, 0, 0, tzinfo=timezone.utc))
+    now_fn = _clock(_T0)
     active = claims.list_claims(path=path, now_fn=now_fn)  # must not raise
     assert [r["claim_id"] for r in active] == ["good"]
 
@@ -265,7 +270,7 @@ def test_corrupt_file_renamed_aside_and_ops_continue(tmp_path, content):
     corrupt_path = path.with_suffix(path.suffix + ".corrupt")
     path.write_text(content, encoding="utf-8")
 
-    now_fn = _clock(datetime(2026, 7, 13, 18, 0, 0, tzinfo=timezone.utc))
+    now_fn = _clock(_T0)
     assert claims.list_claims(path=path, now_fn=now_fn) == []  # no raise
     assert corrupt_path.exists()
     assert corrupt_path.read_text(encoding="utf-8") == content  # preserved
@@ -278,7 +283,7 @@ def test_corrupt_file_renamed_aside_and_ops_continue(tmp_path, content):
 
 def test_missing_file_is_not_treated_as_corrupt(tmp_path):
     path = tmp_path / "claims.json"
-    now_fn = _clock(datetime(2026, 7, 13, 18, 0, 0, tzinfo=timezone.utc))
+    now_fn = _clock(_T0)
     assert claims.list_claims(path=path, now_fn=now_fn) == []
     assert not path.with_suffix(path.suffix + ".corrupt").exists()
 
@@ -288,7 +293,7 @@ def test_missing_file_is_not_treated_as_corrupt(tmp_path):
 
 def test_renew_of_expired_claim_returns_not_ok(tmp_path):
     path = tmp_path / "claims.json"
-    now_fn = _clock(datetime(2026, 7, 13, 18, 0, 0, tzinfo=timezone.utc))
+    now_fn = _clock(_T0)
     created = claims.claim("llama3.2", "a", "x", ttl_seconds=60,
                            path=path, now_fn=now_fn)
     now_fn.tick(61)  # past the TTL
@@ -299,7 +304,7 @@ def test_renew_of_expired_claim_returns_not_ok(tmp_path):
 def test_expired_records_are_pruned_by_next_write(tmp_path):
     import json
     path = tmp_path / "claims.json"
-    now_fn = _clock(datetime(2026, 7, 13, 18, 0, 0, tzinfo=timezone.utc))
+    now_fn = _clock(_T0)
     claims.claim("old-model", "a", "x", ttl_seconds=60, path=path, now_fn=now_fn)
     now_fn.tick(61)  # first claim expires
     claims.claim("new-model", "b", "y", ttl_seconds=60, path=path, now_fn=now_fn)
@@ -312,7 +317,7 @@ def test_expired_records_are_pruned_by_next_write(tmp_path):
 def test_renew_prunes_expired_records_but_keeps_renewed_one(tmp_path):
     import json
     path = tmp_path / "claims.json"
-    now_fn = _clock(datetime(2026, 7, 13, 18, 0, 0, tzinfo=timezone.utc))
+    now_fn = _clock(_T0)
     claims.claim("doomed", "a", "x", ttl_seconds=60, path=path, now_fn=now_fn)
     keeper = claims.claim("keeper", "b", "y", ttl_seconds=7200,
                           path=path, now_fn=now_fn)
@@ -322,3 +327,19 @@ def test_renew_prunes_expired_records_but_keeps_renewed_one(tmp_path):
 
     on_disk = json.loads(path.read_text(encoding="utf-8"))
     assert [r["model"] for r in on_disk["claims"]] == ["keeper"]
+
+
+def test_release_prunes_with_injected_clock_sibling_survives(tmp_path):
+    """release() must prune with now_fn, not the wall clock: the test epoch is
+    in the past relative to real time, so wall-clock pruning would silently
+    destroy the surviving sibling claim."""
+    path = tmp_path / "claims.json"
+    now_fn = _clock(_T0)
+    keeper = claims.claim("llama3.2", "keeper", "still-working",
+                          ttl_seconds=3600, path=path, now_fn=now_fn)
+    goner = claims.claim("qwen3:8b", "goner", "done", path=path, now_fn=now_fn)
+
+    assert claims.release(goner["claim_id"], path=path, now_fn=now_fn) == {"ok": True}
+
+    survivors = claims.list_claims(path=path, now_fn=now_fn)
+    assert [c["claim_id"] for c in survivors] == [keeper["claim_id"]]

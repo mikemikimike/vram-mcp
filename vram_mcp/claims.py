@@ -209,8 +209,15 @@ def renew(
     return {"ok": False}
 
 
-def release(claim_id: str, *, path: Optional[Path] = None) -> dict:
-    """Remove a claim immediately (before its TTL expires)."""
+def release(
+    claim_id: str, *,
+    path: Optional[Path] = None, now_fn: Callable[[], datetime] = _default_now,
+) -> dict:
+    """Remove a claim immediately (before its TTL expires).
+
+    ``now_fn`` matches the other write paths (clock injection for tests) and
+    drives the same expired-record pruning every locked write performs.
+    """
     path = path or _DEFAULT_PATH
     with _locked(path):
         data = _load(path)
@@ -221,7 +228,7 @@ def release(claim_id: str, *, path: Optional[Path] = None) -> dict:
         ]
         found = len(data["claims"]) != before
         if found:
-            _prune_expired(data, _default_now())
+            _prune_expired(data, now_fn())
             _save(path, data)
     return {"ok": found}
 

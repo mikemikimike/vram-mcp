@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-_BYTES_PER_MB = 1024 * 1024
+from ._util import bytes_to_mb as _shared_bytes_to_mb
 
 
 def _default_nvml():
@@ -23,13 +23,8 @@ def _default_nvml():
 
 
 def _b2mb(value) -> Optional[int]:
-    """Bytes -> whole MiB; ``None`` on ``None`` or any non-convertible value."""
-    if value is None:
-        return None
-    try:
-        return int(value) // _BYTES_PER_MB
-    except (TypeError, ValueError):
-        return None
+    """Bytes -> whole MB; ``None`` where "unreported" is meaningful (WDDM)."""
+    return _shared_bytes_to_mb(value, default=None)
 
 
 def _with_device(nvml, device_index, fn, default):
@@ -46,14 +41,10 @@ def _with_device(nvml, device_index, fn, default):
     except Exception:
         return default
     try:
-        try:
-            handle = nvml.nvmlDeviceGetHandleByIndex(device_index)
-        except Exception:
-            return default
-        try:
-            return fn(nvml, handle)
-        except Exception:
-            return default
+        handle = nvml.nvmlDeviceGetHandleByIndex(device_index)
+        return fn(nvml, handle)
+    except Exception:
+        return default
     finally:
         try:
             nvml.nvmlShutdown()
@@ -172,5 +163,9 @@ def nvml_busy(pid: int, device_index: int = 0, *, nvml=None) -> Optional[bool]:
     Thin wrapper over :func:`nvml_busy_map` for a single pid — same semantics:
     ``True`` if any buffered sample has ``smUtil > 0``, ``False`` if samples
     exist but all zero, ``None`` if undetermined.
+
+    Kept as public convenience API for external callers checking one pid;
+    vram-mcp's own server path uses :func:`nvml_busy_map` (one NVML session
+    for all pids).
     """
     return nvml_busy_map([pid], device_index, nvml=nvml).get(pid)

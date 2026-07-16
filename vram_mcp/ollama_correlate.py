@@ -33,6 +33,8 @@ import sys
 from pathlib import Path
 from typing import Optional
 
+from ._util import run_capture
+
 _BLOB_DIGEST_RE = re.compile(r"sha256-([0-9a-f]{64})", re.IGNORECASE)
 _MODEL_LAYER_MEDIA_TYPE = "application/vnd.ollama.image.model"
 _OFFICIAL_REGISTRY = "registry.ollama.ai"
@@ -72,6 +74,7 @@ def _list_llama_server_processes_windows(timeout: int = 5) -> list[dict]:
     except FileNotFoundError:
         return _list_llama_server_processes_windows_cim(timeout)
     except (subprocess.TimeoutExpired, subprocess.CalledProcessError, OSError):
+        # Anything but a missing binary: no fallback, degrade to [].
         return []
     out = []
     lines = [ln.rstrip() for ln in result.stdout.splitlines() if ln.strip()]
@@ -89,29 +92,19 @@ def _list_llama_server_processes_windows_cim(timeout: int = 5) -> list[dict]:
         "Get-CimInstance Win32_Process -Filter \"Name='llama-server.exe'\" "
         "| ForEach-Object { '{0}|{1}' -f $_.ProcessId, $_.CommandLine }"
     )
-    try:
-        result = subprocess.run(
-            ["powershell", "-NoProfile", "-Command", command],
-            capture_output=True, text=True, timeout=timeout, check=True,
-        )
-    except (FileNotFoundError, subprocess.TimeoutExpired,
-            subprocess.CalledProcessError, OSError):
+    out = run_capture(["powershell", "-NoProfile", "-Command", command], timeout)
+    if out is None:
         return []
-    return _parse_pid_cmdline_lines(result.stdout.splitlines())
+    return _parse_pid_cmdline_lines(out.splitlines())
 
 
 def _list_llama_server_processes_posix(timeout: int = 5) -> list[dict]:
     """``[{"pid": int, "cmdline": str}, ...]`` via ``ps``. ``[]`` on failure."""
-    try:
-        result = subprocess.run(
-            ["ps", "-eo", "pid,args"],
-            capture_output=True, text=True, timeout=timeout, check=True,
-        )
-    except (FileNotFoundError, subprocess.TimeoutExpired,
-            subprocess.CalledProcessError, OSError):
+    stdout = run_capture(["ps", "-eo", "pid,args"], timeout)
+    if stdout is None:
         return []
     out = []
-    for line in result.stdout.splitlines()[1:]:
+    for line in stdout.splitlines()[1:]:
         line = line.strip()
         if "llama-server" not in line:
             continue
@@ -235,6 +228,10 @@ def find_pid_for_model(
     manifests_root: Optional[Path] = None,
 ) -> Optional[int]:
     """The OS PID of the ``llama-server`` runner currently serving ``model_name``.
+
+    Kept as public convenience API for single-model lookups; vram-mcp's own
+    server path uses :func:`runner_pid_map` (one process listing + one
+    manifest walk for all models).
 
     ``None`` if ``model_name`` is falsy, if Ollama isn't running that model,
     or if correlation fails for any reason (unexpected command-line shape,

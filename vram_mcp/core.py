@@ -11,17 +11,14 @@ import time
 from typing import Callable, Optional
 
 from . import gpu as _gpu
+from ._util import bytes_to_mb as _shared_bytes_to_mb
 
-_BYTES_PER_MB = 1024 * 1024
 _MB_PER_GB = 1024
 
 
 def _bytes_to_mb(value) -> int:
-    """Best-effort bytes -> whole MB, tolerating missing/garbage values."""
-    try:
-        return int(value) // _BYTES_PER_MB
-    except (TypeError, ValueError):
-        return 0
+    """Bytes -> whole MB; 0 for missing/garbage (a number is always expected here)."""
+    return _shared_bytes_to_mb(value, default=0)
 
 
 def _loaded_models(ollama) -> list[dict]:
@@ -50,14 +47,10 @@ def _loaded_models(ollama) -> list[dict]:
 
 class Snapshot:
     """One consistent capture of the coordination signals, taken ONCE per
-    operation and shared across every model it touches.
-
-    Before this existed, each loaded model re-ran the full pipeline (a process
-    listing + a manifest walk + an NVML session + a claims-file read PER
-    model, and again per ``ensure_free`` loop iteration) — N× redundant
-    subprocess/IO work for data that cannot meaningfully change within one
-    call. All three inputs are plain data; a Snapshot is trivially fake-able
-    in tests.
+    operation and shared across every model it touches (the data cannot
+    meaningfully change within a single call, so per-model re-collection
+    would only add subprocess/IO churn). All three inputs are plain data,
+    so a Snapshot is trivially fake-able in tests.
 
     * ``all_claims`` — every active claim record (one ledger read).
     * ``pid_map`` — Ollama tag → runner PID (one process listing + one
@@ -141,7 +134,8 @@ def combined_status(
     gpus = gpu_status_fn()
     loaded = _loaded_models(ollama)
     resolved_pids: set = set()
-    if snapshot_fn is not None:
+    # Nothing loaded -> nothing to enrich; skip the snapshot's subprocess/IO.
+    if snapshot_fn is not None and loaded:
         loaded, resolved_pids = attach_coordination(loaded, snapshot_fn())
     result = {
         "gpus": gpus,
@@ -223,10 +217,11 @@ def ensure_free(
         reverse=True,
     )
 
-    # ONE snapshot for the whole eviction pass: within a single call the
-    # claims/pid/busy state is already stale by less than the settle sleep,
-    # so re-collecting it per iteration bought nothing but subprocess churn.
-    snap = snapshot_fn() if (snapshot_fn is not None and not force) else None
+    # ONE snapshot for the whole eviction pass (protection data cannot
+    # meaningfully change mid-call), and none at all when there are no
+    # candidate models to protect.
+    snap = (snapshot_fn()
+            if (snapshot_fn is not None and not force and models) else None)
 
     unloaded: list[str] = []
     declined: list[dict] = []

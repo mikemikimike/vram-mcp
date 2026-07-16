@@ -1,13 +1,23 @@
 # vram-mcp
 
-An [MCP](https://modelcontextprotocol.io) server that lets AI agents inspect and
-free **NVIDIA GPU VRAM** by managing [Ollama](https://ollama.com) models. Handy
-when you juggle several local models across projects on a single GPU and an
-agent needs to make room before loading the next one.
+An [MCP](https://modelcontextprotocol.io) server that lets AI agents **share
+one NVIDIA GPU** safely. Built for the reality of several Claude Code / agent
+sessions juggling [Ollama](https://ollama.com) models on a single card: before
+loading the next model, an agent can see exactly what's holding VRAM, who's
+using it and why, whether it's computing *right now* — and free space without
+stepping on another session's in-flight work.
 
-- **NVIDIA + Ollama only** for v1.
-- Degrades gracefully when `nvidia-smi` is absent: VRAM readings become
-  `unknown`, but model list / unload / warm still work.
+- **Claims** — sessions declare *who* is using a model and *why*, in a shared
+  crash-safe ledger. TTL-based: a killed session never leaves a stuck claim.
+- **Real busy detection** — windowed per-process GPU utilization via NVML,
+  with zero changes to how anything calls Ollama.
+- **Protected eviction** — `unload`/`ensure_free` refuse to evict a claimed or
+  actively-computing model by default; `force=True` when you've decided.
+- **Full visibility** — every VRAM-holding process on the GPU, not just Ollama
+  models, plus CPU-offload detection (`size_vram < size` = spilled to RAM).
+- **Degrades gracefully** — no `nvidia-smi`/NVML/`wmic`? Readings become
+  `unknown`/`null`, never wrong; model list / unload / warm keep working.
+- NVIDIA + Ollama for now (see [Roadmap](#roadmap)).
 
 ## Tools
 

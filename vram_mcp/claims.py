@@ -11,134 +11,32 @@ doesn't leave a permanently-stuck claim.
 
 from __future__ import annotations
 
-import json
-import os
-import time
 import uuid
-from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, Optional
 
+from ._util import (
+    locked as _locked, iso as _iso, parse_iso as _parse_iso,
+    save_json_atomic, load_json,
+)
+
 _DEFAULT_PATH = Path.home() / ".cache" / "vram-mcp" / "claims.json"
-
-# A lock file older than this is presumed abandoned (its holder was killed
-# without running the ``finally`` cleanup) and is broken by the next waiter.
-# Real critical sections here are milliseconds long, so 30s is very generous.
-_LOCK_STALE_SECONDS = 30.0
-
-# Windows: a concurrent lock-free reader that momentarily has claims.json
-# open makes ``os.replace`` fail with a sharing violation (PermissionError,
-# WinError 5) because CPython's ``open`` doesn't pass FILE_SHARE_DELETE.
-# Readers close the file quickly, so a short retry loop rides it out.
-_REPLACE_ATTEMPTS = 10
-_REPLACE_RETRY_SLEEP = 0.02
 
 
 def _default_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _iso(dt: datetime) -> str:
-    return dt.isoformat(timespec="seconds").replace("+00:00", "Z")
-
-
-def _parse_iso(text: str) -> datetime:
-    return datetime.fromisoformat(text.replace("Z", "+00:00"))
-
-
-@contextmanager
-def _locked(path: Path, timeout: float = 5.0, poll: float = 0.05):
-    """Serialize access to ``path`` via a sibling ``.lock`` file.
-
-    Uses ``os.open`` with ``O_CREAT | O_EXCL`` — atomic file creation that
-    fails if the lock already exists, cross-platform (Windows and POSIX both
-    honor ``O_EXCL``). Raises ``TimeoutError`` if a LIVE lock can't be
-    acquired within ``timeout`` seconds (another process holds it).
-
-    A lock whose mtime is older than ``_LOCK_STALE_SECONDS`` is presumed
-    abandoned (holder hard-killed before its cleanup ran) and is removed so
-    one dead process can't brick every future session. The holder's PID and
-    an ISO timestamp are written into the lock file purely as forensic info.
-    """
-    lock_path = path.with_suffix(path.suffix + ".lock")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    deadline = time.monotonic() + timeout
-    fd = None
-    while fd is None:
-        try:
-            fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-        except FileExistsError:
-            try:
-                age = time.time() - os.stat(lock_path).st_mtime
-            except OSError:
-                # Lock vanished between open() and stat() — retry right away.
-                continue
-            if age > _LOCK_STALE_SECONDS:
-                try:
-                    os.remove(lock_path)
-                except FileNotFoundError:
-                    pass  # another waiter broke it first — fine
-                continue  # retry immediately, no poll sleep
-            if time.monotonic() >= deadline:
-                raise TimeoutError(f"could not acquire lock {lock_path}")
-            time.sleep(poll)
-    try:
-        os.write(fd, f"{os.getpid()} {_iso(_default_now())}\n".encode("utf-8"))
-    except OSError:
-        pass  # forensic info only — never fail acquisition over it
-    try:
-        yield
-    finally:
-        os.close(fd)
-        try:
-            os.remove(lock_path)
-        except OSError:
-            pass
-
-
-def _quarantine(path: Path) -> None:
-    """Move an unreadable/wrong-shape ledger aside (best-effort) so the next
-    write doesn't silently destroy it."""
-    try:
-        os.replace(path, path.with_suffix(path.suffix + ".corrupt"))
-    except OSError:
-        pass
-
-
 def _load(path: Path) -> dict:
-    if not path.exists():
-        return {"claims": []}
-    try:
-        doc = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        doc = None
-    if not isinstance(doc, dict) or not isinstance(doc.get("claims"), list):
-        # File exists but is corrupt or the wrong shape: preserve it as
-        # claims.json.corrupt instead of letting the next _save wipe it.
-        _quarantine(path)
-        return {"claims": []}
-    return doc
+    return load_json(
+        path, lambda: {"claims": []},
+        lambda d: isinstance(d, dict) and isinstance(d.get("claims"), list),
+    )
 
 
 def _save(path: Path, data: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
-    for attempt in range(_REPLACE_ATTEMPTS):
-        try:
-            os.replace(tmp, path)
-            return
-        except PermissionError:
-            # Windows sharing violation: a lock-free reader briefly has the
-            # destination open. Retry; readers finish in well under 200ms.
-            if attempt == _REPLACE_ATTEMPTS - 1:
-                try:
-                    os.remove(tmp)
-                except OSError:
-                    pass
-                raise
-            time.sleep(_REPLACE_RETRY_SLEEP)
+    save_json_atomic(path, data)
 
 
 def _is_active(record: dict, now: datetime) -> bool:

@@ -4,7 +4,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from vram_mcp import claims
+from vram_mcp import _util, claims
 
 # Shared test epoch: every test pins the clock here (in the past relative to
 # wall time — which is exactly why write paths must honor now_fn, never the
@@ -149,7 +149,7 @@ def test_stale_lock_is_broken_and_claim_succeeds(tmp_path):
     path = tmp_path / "claims.json"
     lock_path = path.with_suffix(path.suffix + ".lock")
     lock_path.write_text("9999 2026-07-13T00:00:00Z\n")  # abandoned holder
-    old = time.time() - (claims._LOCK_STALE_SECONDS + 30)
+    old = time.time() - (_util.LOCK_STALE_SECONDS + 30)
     os.utime(lock_path, (old, old))
 
     now_fn = _clock(_T0)
@@ -167,7 +167,7 @@ def test_stale_lock_break_tolerates_losing_the_removal_race(tmp_path):
     path = tmp_path / "claims.json"
     lock_path = path.with_suffix(path.suffix + ".lock")
     lock_path.write_text("stale\n")
-    old = time.time() - (claims._LOCK_STALE_SECONDS + 30)
+    old = time.time() - (_util.LOCK_STALE_SECONDS + 30)
     os.utime(lock_path, (old, old))
 
     real_remove = os.remove
@@ -184,13 +184,13 @@ def test_stale_lock_break_tolerates_losing_the_removal_race(tmp_path):
             return racing_remove(p)
         return real_remove(p)
 
-    original = claims.os.remove
-    claims.os.remove = remove_once
+    original = _util.os.remove
+    _util.os.remove = remove_once
     try:
         with claims._locked(path, timeout=1.0):
             pass
     finally:
-        claims.os.remove = original
+        _util.os.remove = original
     assert raced["done"]
 
 
@@ -208,7 +208,7 @@ def test_save_retries_replace_on_permission_error_then_succeeds(tmp_path, monkey
             raise PermissionError(13, "The process cannot access the file")
         return real_replace(src, dst)
 
-    monkeypatch.setattr(claims.os, "replace", flaky_replace)
+    monkeypatch.setattr(_util.os, "replace", flaky_replace)
     now_fn = _clock(_T0)
     result = claims.claim("llama3.2", "a", "x", path=tmp_path / "claims.json",
                           now_fn=now_fn)
@@ -224,7 +224,7 @@ def test_save_gives_up_after_retries_and_cleans_tmp(tmp_path, monkeypatch):
     def always_fails(src, dst):
         raise PermissionError(13, "The process cannot access the file")
 
-    monkeypatch.setattr(claims.os, "replace", always_fails)
+    monkeypatch.setattr(_util.os, "replace", always_fails)
     now_fn = _clock(_T0)
     with pytest.raises(PermissionError):
         claims.claim("llama3.2", "a", "x", path=path, now_fn=now_fn)

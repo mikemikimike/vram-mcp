@@ -54,12 +54,16 @@ def _procinfo_table() -> list:
 
 def _run_detection(status: dict) -> None:
     """Diff the meaningful-holder set from a status snapshot and log changes.
-    Best-effort; disabled by VRAM_MCP_AUDIT=0."""
+    Best-effort; disabled by VRAM_MCP_AUDIT=0 — never raises (the audit may
+    never break a tool call)."""
     if not _AUDIT_ON:
         return
-    holders = _audit.meaningful_holders(
-        status.get("loaded", []), status.get("other_processes", []), _MEANINGFUL_MB)
-    _audit.detect_and_log(holders, cap=_EVENT_CAP)
+    try:
+        holders = _audit.meaningful_holders(
+            status.get("loaded", []), status.get("other_processes", []), _MEANINGFUL_MB)
+        _audit.detect_and_log(holders, cap=_EVENT_CAP)
+    except Exception:
+        pass
 
 
 def _fmt_free(free_mb) -> str:

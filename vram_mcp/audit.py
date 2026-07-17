@@ -8,6 +8,7 @@ and paths (injected in tests).
 """
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -113,6 +114,19 @@ def _disappeared_event(holder: dict, now: datetime, log_path: Path) -> dict:
             "detail": "process exited or was killed; vram-mcp cannot observe the cause."}
 
 
+def _valid_baseline_exists(path: Path) -> bool:
+    """True only if ``path`` holds a readable, correctly-shaped baseline.
+    Missing, unreadable, or wrong-shape all count as 'no baseline' -> a fresh
+    first run that must NOT emit appeared/disappeared events."""
+    if not path.exists():
+        return False
+    try:
+        doc = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return isinstance(doc, dict) and isinstance(doc.get("holders"), dict)
+
+
 def detect_and_log(current_holders, *, last_seen_path: Path = DEFAULT_LAST_SEEN_PATH,
                    log_path: Path = DEFAULT_EVENTS_PATH, now_fn=_default_now,
                    cap: int = 5000) -> list[dict]:
@@ -123,7 +137,7 @@ def detect_and_log(current_holders, *, last_seen_path: Path = DEFAULT_LAST_SEEN_
     try:
         now = now_fn()
         with locked(last_seen_path):
-            first_run = not last_seen_path.exists()
+            first_run = not _valid_baseline_exists(last_seen_path)
             prev = load_json(last_seen_path, lambda: {"holders": {}},
                              lambda d: isinstance(d, dict) and isinstance(d.get("holders"), dict))
             prev_map = prev["holders"]

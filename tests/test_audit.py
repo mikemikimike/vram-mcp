@@ -138,6 +138,30 @@ def test_detect_appearance_logged(tmp_path):
     assert emitted[0]["type"] == "appeared" and emitted[0]["target"] == "llama3.2"
 
 
+def test_detect_corrupt_baseline_treated_as_first_run_no_storm(tmp_path):
+    ls, log = tmp_path / "last_seen.json", tmp_path / "events.jsonl"
+    ls.write_text("garbage {", encoding="utf-8")
+    clk = _clock()
+    p = [_holder("process:100", "python train.py", "process", 14492)]
+    emitted = audit.detect_and_log(p, last_seen_path=ls, log_path=log, now_fn=clk)
+    assert emitted == []                       # corrupt baseline -> fresh first run, no storm
+    assert audit.read_events(path=log) == []
+    clk.tick(30)
+    gone = audit.detect_and_log([], last_seen_path=ls, log_path=log, now_fn=clk)
+    assert len(gone) == 1
+    assert gone[0]["type"] == "disappeared" and gone[0]["cause"] == "unattributed"
+
+
+def test_detect_valid_empty_baseline_still_fires_appeared(tmp_path):
+    ls, log = tmp_path / "last_seen.json", tmp_path / "events.jsonl"
+    ls.write_text('{"holders": {}}', encoding="utf-8")
+    clk = _clock()
+    m = [_holder("ollama:llama3.2", "llama3.2", "ollama")]
+    emitted = audit.detect_and_log(m, last_seen_path=ls, log_path=log, now_fn=clk)
+    assert len(emitted) == 1
+    assert emitted[0]["type"] == "appeared" and emitted[0]["target"] == "llama3.2"
+
+
 def test_detect_second_session_does_not_double_log(tmp_path):
     ls, log = tmp_path / "last_seen.json", tmp_path / "events.jsonl"
     clk = _clock()

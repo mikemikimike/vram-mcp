@@ -34,6 +34,33 @@ mcp = FastMCP("vram-mcp")
 _OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
 _ollama = OllamaClient(base_url=_OLLAMA_BASE_URL)
 
+from . import audit as _audit
+from . import procinfo as _procinfo
+
+_AUDIT_ON = os.environ.get("VRAM_MCP_AUDIT", "1") != "0"
+_MEANINGFUL_MB = int(os.environ.get("VRAM_MCP_MEANINGFUL_MB", "512"))
+_EVENT_CAP = int(os.environ.get("VRAM_MCP_EVENT_CAP", "5000"))
+
+
+def _procinfo_table() -> list:
+    """Sized+named process table; the Windows perf-counter fallback only fires
+    when NVML sizes are null (inside win_gpu_procs, which no-ops off-Windows)."""
+    return _procinfo.process_table(
+        nvml_processes=_nvml.nvml_processes,
+        win_gpu_reader=_procinfo.win_gpu_procs,
+        posix_name_reader=_procinfo.posix_name_reader,
+    )
+
+
+def _run_detection(status: dict) -> None:
+    """Diff the meaningful-holder set from a status snapshot and log changes.
+    Best-effort; disabled by VRAM_MCP_AUDIT=0."""
+    if not _AUDIT_ON:
+        return
+    holders = _audit.meaningful_holders(
+        status.get("loaded", []), status.get("other_processes", []), _MEANINGFUL_MB)
+    _audit.detect_and_log(holders, cap=_EVENT_CAP)
+
 
 def _fmt_free(free_mb) -> str:
     return "unknown (nvidia-smi unavailable)" if free_mb is None else f"{free_mb} MB"
@@ -52,7 +79,7 @@ def _full_status() -> dict:
     return core.combined_status(
         gpu_status, _ollama,
         snapshot_fn=_snapshot,
-        nvml_processes_fn=_nvml.nvml_processes,
+        procinfo_fn=(_procinfo_table if _AUDIT_ON else _nvml.nvml_processes),
     )
 
 
@@ -65,6 +92,7 @@ async def _in_thread(fn, *args, **kwargs):
 
 def _vram_status_impl() -> dict:
     status = _full_status()
+    _run_detection(status)
     n_gpu = len(status["gpus"])
     n_loaded = len(status["loaded"])
     status["summary"] = (
@@ -88,11 +116,13 @@ async def vram_status() -> dict:
 
 def _list_loaded_impl() -> dict:
     # Slimmer than _full_status: this tool returns only the model list, so
-    # skip the nvidia-smi spawn and the NVML process survey whose results
-    # would be discarded.
+    # skip the nvidia-smi spawn — but still gather procinfo (when audit is on)
+    # so detection has a meaningful-holder set to diff against.
     status = core.combined_status(
         lambda: [], _ollama, snapshot_fn=_snapshot,
+        procinfo_fn=(_procinfo_table if _AUDIT_ON else None),
     )
+    _run_detection(status)
     loaded = status["loaded"]
     return {
         "loaded": loaded,
@@ -108,10 +138,13 @@ async def list_loaded() -> dict:
 
 # ── eviction tools ───────────────────────────────────────────────────────────
 
-def _unload_impl(model: str, force: bool) -> dict:
+def _unload_impl(model: str, force: bool, by: str) -> dict:
     if not force:
         protected, detail = core.is_protected(model, _snapshot())
         if protected:
+            _audit.log_action(action="unload", target=model, kind="ollama",
+                              actor=by, force=False, outcome="refused",
+                              detail="protected (claimed or busy)", cap=_EVENT_CAP)
             summary = (
                 f"'{model}' is protected (claimed or busy); "
                 "pass force=True to override."
@@ -130,6 +163,10 @@ def _unload_impl(model: str, force: bool) -> dict:
                 "summary": summary,
             }
     ok = _ollama.unload(model)
+    _audit.log_action(action="unload", target=model, kind="ollama", actor=by,
+                      force=force, outcome=("ok" if ok else "failed"),
+                      detail=("unloaded" if ok else "ollama unload failed"),
+                      cap=_EVENT_CAP)
     return {
         "ok": ok,
         "model": model,
@@ -140,22 +177,29 @@ def _unload_impl(model: str, force: bool) -> dict:
 
 
 @mcp.tool()
-async def unload(model: str, force: bool = False) -> dict:
+async def unload(model: str, force: bool = False, by: str = "unknown") -> dict:
     """Evict a single model from VRAM now (Ollama ``keep_alive=0``).
 
-    Refuses by default if ``model`` has an active claim or a best-effort
-    ``busy`` signal — pass ``force=True`` to override. Note the busy signal
-    is windowed: it can read True for a few seconds after a generation ends,
-    so ``force=True`` is the intended path when you know the work is done.
-    """
-    return await _in_thread(_unload_impl, model, force)
+    Refuses by default if ``model`` has an active claim or a best-effort busy
+    signal — pass ``force=True`` to override (busy is windowed and can lag a few
+    seconds past a generation). ``by`` records who requested the eviction in the
+    audit log (see ``history``)."""
+    return await _in_thread(_unload_impl, model, force, by)
 
 
-def _ensure_free_impl(gb: float, force: bool) -> dict:
+def _ensure_free_impl(gb: float, force: bool, by: str) -> dict:
     result = core.ensure_free(
         gb, gpu_status, _ollama, settle=0.5, force=force,
         snapshot_fn=_snapshot,
     )
+    for name in result["unloaded"]:
+        _audit.log_action(action="ensure_free", target=name, kind="ollama",
+                          actor=by, force=force, outcome="ok",
+                          detail=f"unloaded to free {gb} GB", cap=_EVENT_CAP)
+    for d in result["declined"]:
+        _audit.log_action(action="ensure_free", target=d["name"], kind="ollama",
+                          actor=by, force=force, outcome="refused",
+                          detail="protected (claimed or busy)", cap=_EVENT_CAP)
     if result["already_free"]:
         base = f"Already {_fmt_free(result['free_mb'])} free (target {gb} GB)."
     elif result["ok"]:
@@ -179,20 +223,17 @@ def _ensure_free_impl(gb: float, force: bool) -> dict:
 
 
 @mcp.tool()
-async def ensure_free(gb: float, force: bool = False) -> dict:
-    """Free VRAM until at least ``gb`` gigabytes are available.
-
-    Unloads resident models largest-first until the target is met, skipping
-    claimed/busy models by default (``force=True`` to override; busy is a
-    windowed signal that can lag a few seconds past the end of a generation).
-    Returns which models were unloaded, which were declined (protected), and
-    whether the target was reached.
-    """
-    return await _in_thread(_ensure_free_impl, gb, force)
+async def ensure_free(gb: float, force: bool = False, by: str = "unknown") -> dict:
+    """Free VRAM until at least ``gb`` GB is available. Skips claimed/busy models
+    unless ``force=True``. ``by`` records the requester in the audit log."""
+    return await _in_thread(_ensure_free_impl, gb, force, by)
 
 
-def _warm_impl(model: str, keep_alive: str) -> dict:
+def _warm_impl(model: str, keep_alive: str, by: str) -> dict:
     ok = _ollama.warm(model, keep_alive)
+    _audit.log_action(action="warm", target=model, kind="ollama", actor=by,
+                      force=False, outcome=("ok" if ok else "failed"),
+                      detail=f"keep_alive={keep_alive}", cap=_EVENT_CAP)
     return {
         "ok": ok,
         "model": model,
@@ -206,9 +247,10 @@ def _warm_impl(model: str, keep_alive: str) -> dict:
 
 
 @mcp.tool()
-async def warm(model: str, keep_alive: str = "5m") -> dict:
-    """Load/pin a model into VRAM for ``keep_alive`` (e.g. ``"5m"``, ``"1h"``)."""
-    return await _in_thread(_warm_impl, model, keep_alive)
+async def warm(model: str, keep_alive: str = "5m", by: str = "unknown") -> dict:
+    """Load/pin a model into VRAM for ``keep_alive`` (e.g. ``"5m"``, ``"1h"``).
+    ``by`` records the requester in the audit log."""
+    return await _in_thread(_warm_impl, model, keep_alive, by)
 
 
 # ── claim tools ──────────────────────────────────────────────────────────────
@@ -314,6 +356,24 @@ def _advise_impl() -> dict:
 async def advise() -> dict:
     """Suggest env/config changes to keep VRAM healthy (heuristics)."""
     return await _in_thread(_advise_impl)
+
+
+# ── audit trail ──────────────────────────────────────────────────────────────
+
+def _history_impl(model, type_, limit, since) -> dict:
+    events = _audit.read_events(model=model, type=type_, limit=limit,
+                                since=since, path=_audit.DEFAULT_EVENTS_PATH)
+    return {"events": events, "summary": f"{len(events)} event(s)."}
+
+
+@mcp.tool()
+async def history(model: str | None = None, type: str | None = None,
+                  limit: int = 50, since: str | None = None) -> dict:
+    """The VRAM audit trail, newest first: who ran unload/ensure_free/warm, and
+    which models/processes appeared or disappeared (with a best-effort cause).
+    Filter by ``model``, ``type`` (action|disappeared|appeared), ``limit``, or an
+    ISO ``since`` floor. Answers 'what happened to model X?'."""
+    return await _in_thread(_history_impl, model, type, limit, since)
 
 
 def main() -> None:

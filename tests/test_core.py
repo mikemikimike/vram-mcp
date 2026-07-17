@@ -191,6 +191,24 @@ def test_combined_status_full_wiring():
     assert status["other_processes"] == [{"pid": 999, "size_mb": 100, "kind": "graphics"}]
 
 
+def test_combined_status_other_processes_from_procinfo():
+    models = [{"name": "m1", "size": gb_bytes(4), "size_vram": gb_bytes(4), "expires_at": None}]
+    snap = _snap(pid_map={"m1": 555})
+    status = core.combined_status(
+        gpu_fn_const(8000), FakeOllama(models),
+        snapshot_fn=lambda: snap,
+        procinfo_fn=lambda: [
+            {"pid": 555, "size_mb": 4096, "name": "llama-server.exe", "cmdline": "...", "kind": "compute"},
+            {"pid": 999, "size_mb": 14492, "name": "python.exe", "cmdline": "python train.py", "kind": "compute"},
+        ],
+    )
+    # pid 555 is the m1 runner -> excluded; 999 stays, WITH its size + name.
+    assert status["other_processes"] == [
+        {"pid": 999, "size_mb": 14492, "name": "python.exe",
+         "cmdline": "python train.py", "kind": "compute"},
+    ]
+
+
 def test_combined_status_skips_snapshot_when_nothing_loaded():
     """An idle-status call must not pay the snapshot's subprocess/IO cost."""
     def exploding_snapshot():

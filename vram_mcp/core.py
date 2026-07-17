@@ -119,17 +119,19 @@ def other_processes(nvml_processes_fn, exclude_pids: set) -> list[dict]:
 
 def combined_status(
     gpu_status_fn: Callable[[], list[dict]], ollama, *,
-    snapshot_fn=None, nvml_processes_fn=None,
+    snapshot_fn=None, nvml_processes_fn=None, procinfo_fn=None,
 ) -> dict:
     """Snapshot of GPUs + loaded models + best free VRAM.
 
     Returns ``{"gpus": [...], "loaded": [...], "free_mb": int | None}``, plus
-    ``"other_processes"`` when ``nvml_processes_fn`` is given. Each loaded
-    model always carries ``total_size_mb``/``offloaded_to_cpu``; when
+    ``"other_processes"`` when ``nvml_processes_fn`` or ``procinfo_fn`` is given.
+    Each loaded model always carries ``total_size_mb``/``offloaded_to_cpu``; when
     ``snapshot_fn`` (``() -> Snapshot``) is given it also carries ``claims``
     and ``busy``, all derived from ONE snapshot capture rather than per-model
-    re-collection. Omitting the kwargs gives the plain base shape (tests,
-    ``advise``).
+    re-collection. When ``procinfo_fn`` is given, other_processes entries carry
+    size_mb/name/cmdline/kind (Task 2's sized+named table); it takes precedence
+    over ``nvml_processes_fn``. Omitting the kwargs gives the plain base shape
+    (tests, ``advise``).
     """
     gpus = gpu_status_fn()
     loaded = _loaded_models(ollama)
@@ -142,8 +144,9 @@ def combined_status(
         "loaded": loaded,
         "free_mb": _gpu.max_free_mb(gpus),
     }
-    if nvml_processes_fn is not None:
-        result["other_processes"] = other_processes(nvml_processes_fn, resolved_pids)
+    source = procinfo_fn if procinfo_fn is not None else nvml_processes_fn
+    if source is not None:
+        result["other_processes"] = other_processes(source, resolved_pids)
     return result
 
 

@@ -26,12 +26,12 @@ def log_action(*, action: str, target: str, kind: str, actor: str = "unknown",
                now_fn=_default_now, path: Path = DEFAULT_EVENTS_PATH,
                cap: int = 5000) -> None:
     """Append one ``type="action"`` event. Best-effort — never raises."""
-    event = {
-        "ts": iso(now_fn()), "type": "action", "kind": kind, "target": target,
-        "action": action, "actor": actor, "force": force, "outcome": outcome,
-        "detail": detail,
-    }
     try:
+        event = {
+            "ts": iso(now_fn()), "type": "action", "kind": kind, "target": target,
+            "action": action, "actor": actor, "force": force, "outcome": outcome,
+            "detail": detail,
+        }
         with locked(path):
             append_jsonl_capped(path, event, cap)
     except Exception:

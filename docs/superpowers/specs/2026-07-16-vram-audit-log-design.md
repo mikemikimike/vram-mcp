@@ -209,3 +209,29 @@ test, matching `test_claims.py`). Required cases:
   on-demand design; diff-on-status-call is the chosen middle path).
 - Killing or preventing eviction of non-Ollama processes (vram-mcp observes them
   but does not manage them).
+
+## Future note — `advise()` v2 (separate follow-up, NOT this spec)
+
+The current `advise()` recommends only `OLLAMA_MAX_LOADED_MODELS=1` and a finite
+`OLLAMA_KEEP_ALIVE`. Ollama 0.32.0's env surface (from `ollama serve --help`)
+exposes several higher-value VRAM levers `advise()` could suggest based on the
+state it already computes (esp. `offloaded_to_cpu` and low free VRAM):
+
+- `OLLAMA_KV_CACHE_TYPE=q8_0` — biggest lever; ~halves KV-cache VRAM, can make an
+  offloaded model fit fully on-GPU. **Requires `OLLAMA_FLASH_ATTENTION=1`**
+  (verify this coupling at build time) — advise the pair together.
+- `OLLAMA_FLASH_ATTENTION=1` — cuts KV-cache memory + faster.
+- `OLLAMA_CONTEXT_LENGTH` — KV cache scales with context; an oversized default can
+  spill a model to CPU. Advise lowering when a model is offloaded.
+- `OLLAMA_GPU_OVERHEAD` / `LLAMA_ARG_FIT_TARGET` — reserve a VRAM margin so
+  Ollama's scheduler leaves room for a **non-Ollama** job (e.g. a FLUX training
+  run). This is the Ollama-side complement to vram-mcp's whole coordination
+  purpose — the most on-theme addition.
+- `OLLAMA_NUM_PARALLEL` — each parallel slot multiplies KV cache; advise lowering
+  on a tight GPU.
+
+Also flagged for later: 0.32.0 added **experimental image generation**
+(`ollama run --width/--height/--steps/--seed`). If diffusion models eventually run
+*through* Ollama, this spec's "Ollama = LLM-only; FLUX is a foreign process"
+assumption changes and the resolver/attribution split may need revisiting.
+Not actionable now; revisit when it lands.

@@ -135,7 +135,10 @@ Call `history(model=None, type=None, limit=50, since=None)` to query it — e.g.
 hour?". The whole audit path is best-effort: a failure to read or write the log
 never breaks a tool call. Disable detection (and its ~1 s Windows perf-counter
 cost) with `VRAM_MCP_AUDIT=0`; tune retention with `VRAM_MCP_EVENT_CAP` and the
-size threshold with `VRAM_MCP_MEANINGFUL_MB`.
+size threshold with `VRAM_MCP_MEANINGFUL_MB`. Action events
+(`unload`/`ensure_free`/`warm`) are always recorded regardless of
+`VRAM_MCP_AUDIT`; the variable gates only the passive disappearance/appearance
+detection and the perf-counter process table.
 
 `other_processes` (from `vram_status()`) now carries real `size_mb`/`name`/
 `cmdline` for every VRAM-holding process, not just Ollama's — on Windows via a

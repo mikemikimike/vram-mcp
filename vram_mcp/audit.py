@@ -135,8 +135,8 @@ def detect_and_log(current_holders, *, last_seen_path: Path = DEFAULT_LAST_SEEN_
     events emitted. Best-effort — never raises out to the caller."""
     emitted: list[dict] = []
     try:
-        now = now_fn()
         with locked(last_seen_path):
+            now = now_fn()
             first_run = not _valid_baseline_exists(last_seen_path)
             prev = load_json(last_seen_path, lambda: {"holders": {}},
                              lambda d: isinstance(d, dict) and isinstance(d.get("holders"), dict))
@@ -155,9 +155,21 @@ def detect_and_log(current_holders, *, last_seen_path: Path = DEFAULT_LAST_SEEN_
                             "detail": "now holding VRAM",
                         })
 
-            for e in emitted:
-                append_jsonl_capped(log_path, e, cap)
+            # Baseline is saved BEFORE we release the last_seen lock, so a
+            # concurrent session already sees the holder gone and won't re-log it.
             save_json_atomic(last_seen_path, {"holders": cur_map})
     except Exception:
         return emitted
+    # Append events OUTSIDE the last_seen lock, under the EVENTS lock, so both
+    # writers of events.jsonl (this function and log_action) are serialized.
+    # Lock order is acyclic (last_seen is already released here; log_action
+    # never takes the last_seen lock), and best-effort — a failed append never
+    # breaks the caller.
+    if emitted:
+        try:
+            with locked(log_path):
+                for e in emitted:
+                    append_jsonl_capped(log_path, e, cap)
+        except Exception:
+            pass
     return emitted

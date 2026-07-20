@@ -235,6 +235,24 @@ def is_protected(model_name: str, snap: Snapshot) -> tuple[bool, dict]:
     return protected, {"claims": active_claims, "busy": busy}
 
 
+def reserved_mb(all_claims: list[dict]) -> int:
+    """Total VRAM (MB) spoken for by active reservations.
+
+    ``all_claims`` is the ledger's already-expiry-filtered list, so every
+    reservation here is live. Malformed records are skipped rather than
+    raising — one unusable record must not break a status call.
+    """
+    total = 0.0
+    for record in all_claims:
+        if not isinstance(record, dict) or record.get("kind") != "reservation":
+            continue
+        try:
+            total += float(record["gb"])
+        except (KeyError, TypeError, ValueError):
+            continue
+    return int(round(total * _MB_PER_GB))
+
+
 def ensure_free(
     target_gb: float,
     gpu_status_fn: Callable[[], list[dict]],

@@ -388,6 +388,37 @@ def test_is_protected_false_when_no_pid_and_no_claim():
     assert detail["busy"] is None
 
 
+# ---- reserved_mb -------------------------------------------------------------
+
+def test_reserved_mb_sums_active_reservations():
+    recs = [{"kind": "reservation", "gb": 8.0},
+            {"kind": "reservation", "gb": 2.5},
+            {"kind": "model", "model": "llama3"}]
+    assert core.reserved_mb(recs) == int(round(10.5 * 1024))
+
+
+def test_reserved_mb_skips_malformed():
+    recs = [{"kind": "reservation", "gb": "eight"},
+            {"kind": "reservation"},
+            "not-a-dict",
+            {"kind": "reservation", "gb": 1.0}]
+    assert core.reserved_mb(recs) == 1024
+
+
+def test_reserved_mb_empty():
+    assert core.reserved_mb([]) == 0
+
+
+def test_reservations_never_protect_a_model():
+    snap = core.Snapshot(
+        all_claims=[{"kind": "reservation", "model": None, "gb": 8.0}],
+        pid_map={}, busy_map={},
+    )
+    protected, detail = core.is_protected("llama3", snap)
+    assert protected is False
+    assert detail["claims"] == []
+
+
 # ---- ensure_free protection ---------------------------------------------------
 
 def test_ensure_free_skips_protected_model_and_reports_declined():

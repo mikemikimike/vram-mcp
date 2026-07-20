@@ -68,7 +68,44 @@ def claim(
     expires_at = now + timedelta(seconds=ttl_seconds)
     record = {
         "claim_id": uuid.uuid4().hex,
+        "kind": "model",
         "model": model, "owner": owner, "purpose": purpose,
+        "claimed_at": _iso(now), "renewed_at": _iso(now),
+        "ttl_seconds": ttl_seconds, "expires_at": _iso(expires_at),
+    }
+    with _locked(path):
+        data = _load(path)
+        _prune_expired(data, now)
+        data["claims"].append(record)
+        _save(path, data)
+    return {"claim_id": record["claim_id"], "expires_at": record["expires_at"]}
+
+
+def reserve(
+    gb: float, owner: str, purpose: str, ttl_seconds: int = 3600, *,
+    pid: Optional[int] = None, path: Optional[Path] = None,
+    now_fn: Callable[[], datetime] = _default_now,
+) -> dict:
+    """Reserve ``gb`` GB of VRAM for ``owner`` — a claim on capacity rather
+    than on a named model.
+
+    The GPU's biggest consumer is often not an Ollama model (a training run, a
+    diffusion job), and such a process has no other way to tell other sessions
+    its VRAM is spoken for. Reservations share the ledger with model claims, so
+    they inherit the same TTL and crash-safety semantics, tagged
+    ``kind="reservation"`` and carrying ``model=None`` so they can never shadow
+    or protect a model. ``pid`` is advisory: it records which process the
+    reservation is for.
+
+    Returns ``{"claim_id", "expires_at"}``.
+    """
+    path = path or _DEFAULT_PATH
+    now = now_fn()
+    expires_at = now + timedelta(seconds=ttl_seconds)
+    record = {
+        "claim_id": uuid.uuid4().hex, "kind": "reservation",
+        "model": None, "gb": float(gb), "pid": pid,
+        "owner": owner, "purpose": purpose,
         "claimed_at": _iso(now), "renewed_at": _iso(now),
         "ttl_seconds": ttl_seconds, "expires_at": _iso(expires_at),
     }
@@ -144,10 +181,18 @@ def list_claims(
     flip side on Windows is that a reader holding the file open can make a
     concurrent writer's ``os.replace`` fail with a sharing violation, which
     ``_save`` handles by retrying briefly.
+
+    The ledger holds both kinds of record. Reservations (``kind="reservation"``,
+    ``model=None``) are returned by an unfiltered call — that's how a caller
+    totals the VRAM other sessions have spoken for — and are always excluded by
+    a ``model=`` filter, since a reservation names no model. Records written by
+    older versions carry no ``kind`` at all and are treated as model claims,
+    exactly as before; the filter uses ``.get("model")`` so a record missing the
+    key entirely is skipped rather than raising.
     """
     path = path or _DEFAULT_PATH
     now = now_fn()
     active = [r for r in _load(path)["claims"] if _is_active(r, now)]
     if model is not None:
-        active = [r for r in active if r["model"] == model]
+        active = [r for r in active if r.get("model") == model]
     return active

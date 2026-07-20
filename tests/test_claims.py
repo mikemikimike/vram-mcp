@@ -1,5 +1,6 @@
 """Tests for vram_mcp.claims — real temp-dir file I/O (atomicity is the point)."""
 
+import json
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -343,3 +344,65 @@ def test_release_prunes_with_injected_clock_sibling_survives(tmp_path):
 
     survivors = claims.list_claims(path=path, now_fn=now_fn)
     assert [c["claim_id"] for c in survivors] == [keeper["claim_id"]]
+
+
+# --- reservations: a claim on GB of VRAM rather than on a named model
+
+
+def test_reserve_round_trip(tmp_path):
+    path = tmp_path / "claims.json"
+    now = datetime(2026, 7, 19, 12, 0, 0, tzinfo=timezone.utc)
+    r = claims.reserve(8.0, "trainer", "dpo run", 3600,
+                       pid=1234, path=path, now_fn=lambda: now)
+    assert r["claim_id"]
+    (rec,) = claims.list_claims(path=path, now_fn=lambda: now)
+    assert rec["kind"] == "reservation"
+    assert rec["gb"] == 8.0
+    assert rec["pid"] == 1234
+    assert rec["model"] is None
+
+
+def test_reservation_expires_by_ttl(tmp_path):
+    path = tmp_path / "claims.json"
+    now = datetime(2026, 7, 19, 12, 0, 0, tzinfo=timezone.utc)
+    claims.reserve(8.0, "trainer", "dpo", 60, path=path, now_fn=lambda: now)
+    later = now + timedelta(seconds=61)
+    assert claims.list_claims(path=path, now_fn=lambda: later) == []
+
+
+def test_claim_records_are_tagged_model(tmp_path):
+    path = tmp_path / "claims.json"
+    now = datetime(2026, 7, 19, 12, 0, 0, tzinfo=timezone.utc)
+    claims.claim("llama3", "me", "chat", 3600, path=path, now_fn=lambda: now)
+    (rec,) = claims.list_claims(path=path, now_fn=lambda: now)
+    assert rec["kind"] == "model"
+
+
+def test_list_claims_by_model_excludes_reservations(tmp_path):
+    path = tmp_path / "claims.json"
+    now = datetime(2026, 7, 19, 12, 0, 0, tzinfo=timezone.utc)
+    claims.claim("llama3", "me", "chat", 3600, path=path, now_fn=lambda: now)
+    claims.reserve(8.0, "trainer", "dpo", 3600, path=path, now_fn=lambda: now)
+    got = claims.list_claims("llama3", path=path, now_fn=lambda: now)
+    assert len(got) == 1
+    assert got[0]["kind"] == "model"
+
+
+def test_legacy_record_without_kind_still_lists(tmp_path):
+    path = tmp_path / "claims.json"
+    now = datetime(2026, 7, 19, 12, 0, 0, tzinfo=timezone.utc)
+    expires = (now + timedelta(hours=1)).isoformat().replace("+00:00", "Z")
+    path.write_text(json.dumps({"claims": [
+        {"claim_id": "old", "model": "llama3", "owner": "me",
+         "purpose": "chat", "ttl_seconds": 3600, "expires_at": expires},
+    ]}), encoding="utf-8")
+    got = claims.list_claims("llama3", path=path, now_fn=lambda: now)
+    assert len(got) == 1
+
+
+def test_reservation_can_be_released(tmp_path):
+    path = tmp_path / "claims.json"
+    now = datetime(2026, 7, 19, 12, 0, 0, tzinfo=timezone.utc)
+    r = claims.reserve(8.0, "trainer", "dpo", 3600, path=path, now_fn=lambda: now)
+    assert claims.release(r["claim_id"], path=path, now_fn=lambda: now)["ok"]
+    assert claims.list_claims(path=path, now_fn=lambda: now) == []

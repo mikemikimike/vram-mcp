@@ -409,6 +409,49 @@ def test_reserved_mb_empty():
     assert core.reserved_mb([]) == 0
 
 
+# ---- can_warm ----------------------------------------------------------------
+
+def test_can_warm_allows_when_it_fits():
+    ok, detail = core.can_warm("llama3", free_mb=20000, reserved_mb=8192,
+                               model_size_mb=4096)
+    assert ok is True
+    assert detail["headroom_mb"] == 20000 - 8192
+
+
+def test_can_warm_refuses_when_reservations_consume_headroom():
+    ok, detail = core.can_warm("qwen3:32b", free_mb=10000, reserved_mb=8192,
+                               model_size_mb=20480)
+    assert ok is False
+    assert detail["reason"] == "insufficient_headroom"
+    assert detail["model_size_mb"] == 20480
+
+
+def test_can_warm_refuses_when_headroom_exhausted_and_size_unknown():
+    ok, detail = core.can_warm("mystery", free_mb=4000, reserved_mb=8192,
+                               model_size_mb=None)
+    assert ok is False
+    assert detail["reason"] == "no_headroom"
+
+
+def test_can_warm_allows_unknown_size_with_headroom():
+    ok, _ = core.can_warm("mystery", free_mb=20000, reserved_mb=1024,
+                          model_size_mb=None)
+    assert ok is True
+
+
+def test_can_warm_allows_when_free_unknown():
+    # VRAM unreadable -> we cannot prove it will not fit; never block on a guess.
+    ok, detail = core.can_warm("m", free_mb=None, reserved_mb=8192,
+                               model_size_mb=4096)
+    assert ok is True
+    assert detail["reason"] == "free_unknown"
+
+
+def test_can_warm_allows_when_nothing_reserved():
+    ok, _ = core.can_warm("m", free_mb=100, reserved_mb=0, model_size_mb=99999)
+    assert ok is True
+
+
 def test_reservations_never_protect_a_model():
     snap = core.Snapshot(
         all_claims=[{"kind": "reservation", "model": None, "gb": 8.0}],

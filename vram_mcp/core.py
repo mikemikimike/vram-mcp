@@ -253,6 +253,39 @@ def reserved_mb(all_claims: list[dict]) -> int:
     return int(round(total * _MB_PER_GB))
 
 
+def can_warm(model: str, *, free_mb, reserved_mb: int, model_size_mb) -> tuple[bool, dict]:
+    """May ``model`` be warmed without eating VRAM another session reserved?
+
+    Cooperative, not enforced: vram-mcp cannot intercept an Ollama auto-load
+    triggered by a direct ``/api/generate`` call from another process, so this
+    gates only vram-mcp's own ``warm()``. Every refusal is overridable with
+    ``force=True``.
+
+    Refuses when reservations leave no headroom at all, or when the model's
+    approximate size exceeds the headroom. Never refuses on a guess: unknown
+    free VRAM always allows.
+
+    Returns ``(allowed, detail)`` where detail carries ``reason``,
+    ``headroom_mb``, ``reserved_mb`` and ``model_size_mb``.
+    """
+    base = {"reserved_mb": reserved_mb, "model_size_mb": model_size_mb,
+            "free_mb": free_mb}
+    if free_mb is None:
+        return True, {**base, "headroom_mb": None, "reason": "free_unknown"}
+
+    headroom = free_mb - reserved_mb
+    detail = {**base, "headroom_mb": headroom}
+    # Nothing reserved -> nobody to protect, so this predicate stays out of the
+    # way even when VRAM looks tight; making room is ensure_free's job.
+    if reserved_mb <= 0:
+        return True, {**detail, "reason": "no_reservations"}
+    if headroom <= 0:
+        return False, {**detail, "reason": "no_headroom"}
+    if model_size_mb is not None and model_size_mb > headroom:
+        return False, {**detail, "reason": "insufficient_headroom"}
+    return True, {**detail, "reason": "fits"}
+
+
 def ensure_free(
     target_gb: float,
     gpu_status_fn: Callable[[], list[dict]],

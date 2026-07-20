@@ -96,8 +96,14 @@ directly at the installed `vram-mcp` script.
 - `OLLAMA_BASE_URL` — Ollama endpoint. Defaults to `http://127.0.0.1:11434`.
 - `VRAM_MCP_AUDIT` — disappearance detection + the perf-counter-based process
   table (`other_processes` size/name/cmdline on Windows). Defaults on; set to
-  `"0"` to disable both and skip the ~1 s Windows perf-counter cost on every
-  `vram_status()`/`list_loaded()` call.
+  `"0"` to disable and skip the ~1 s Windows perf-counter cost on every
+  `vram_status()`/`list_loaded()` call. It turns off **four** things, not one:
+  disappearance/appearance detection, the process table, **driver-spill
+  detection** (`pressure.non_local_mb`/`spilling`/`thrashing` — only the
+  perf-counter table reports non-local VRAM, so `pressure` can still say
+  `degraded`/`tight`/`ok` but never `thrashing`), and **trend sampling** (no
+  samples are recorded, so `trend()` reports nothing over that period).
+  Action events (`unload`/`ensure_free`/`warm`) are recorded either way.
 - `VRAM_MCP_MEANINGFUL_MB` — minimum dedicated VRAM (MB) for a non-Ollama
   process to be tracked by disappearance detection. Defaults to `512`.
 - `VRAM_MCP_EVENT_CAP` — maximum events retained in `events.jsonl` (oldest
@@ -106,6 +112,11 @@ directly at the installed `vram-mcp` script.
   (shared across sessions). Defaults to `60`. The throttle matters: the event
   log is capped, so unthrottled samples would evict the action and
   disappearance events that carry the real diagnostic value.
+- `VRAM_MCP_SPILL_MB` — non-local VRAM (MB) at or above which `pressure`
+  reports `spilling`/`thrashing`. Defaults to `256`, below which non-local
+  usage is ordinary desktop noise (compositor, browser) rather than a model
+  paging to system RAM. Raise it if a background app keeps a steady spill you
+  don't care about; lower it to catch a spill earlier.
 
 ## Multi-session coordination
 
@@ -155,7 +166,11 @@ baseline). Three kinds of events land there:
 - **Samples** — a free-VRAM datapoint recorded on the same status calls, at
   most once per `VRAM_MCP_SAMPLE_SECONDS` across all sessions. `trend(hours)`
   reduces them to a direction, so you can tell a gradual erosion from a sudden
-  spike — the question a point-in-time `vram_status()` can't answer.
+  spike — the question a point-in-time `vram_status()` can't answer. Only calls
+  that actually read the GPU are sampled (`list_loaded()` skips the
+  `nvidia-smi` spawn, so it never records one), and `trend()` returns at most
+  the 200 most recent raw samples — flagged with `samples_truncated` — while
+  its min/max/latest/direction figures always cover the full window.
 
 Call `history(model=None, type=None, limit=50, since=None)` to query it — e.g.
 "what happened to `llama3`?" or "did anything unexpectedly vanish in the last
@@ -164,8 +179,11 @@ never breaks a tool call. Disable detection (and its ~1 s Windows perf-counter
 cost) with `VRAM_MCP_AUDIT=0`; tune retention with `VRAM_MCP_EVENT_CAP` and the
 size threshold with `VRAM_MCP_MEANINGFUL_MB`. Action events
 (`unload`/`ensure_free`/`warm`) are always recorded regardless of
-`VRAM_MCP_AUDIT`; the variable gates only the passive disappearance/appearance
-detection and the perf-counter process table.
+`VRAM_MCP_AUDIT`. Everything *passive* is gated by it, though — setting it to
+`0` disables the disappearance/appearance detection, the perf-counter process
+table, **driver-spill detection** (`pressure` can no longer reach `thrashing`,
+since only that table reports non-local VRAM) and **trend sampling** (nothing
+is recorded, so `trend()` has nothing to report for that period).
 
 `other_processes` (from `vram_status()`) now carries real `size_mb`/`name`/
 `cmdline` for every VRAM-holding process, not just Ollama's — on Windows via a

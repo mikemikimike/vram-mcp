@@ -324,6 +324,7 @@ async def ensure_free(gb: float, force: bool = False, by: str = "unknown") -> di
 
 
 def _warm_impl(model: str, keep_alive: str, by: str, force: bool) -> dict:
+    admission: Optional[dict] = None
     if not force:
         status = core.combined_status(gpu_status, _ollama)
         # Fails open (see _active_claims): an unreadable ledger reads as "no
@@ -359,11 +360,12 @@ def _warm_impl(model: str, keep_alive: str, by: str, force: bool) -> dict:
                     "headroom. Pass force=True to override."
                 ),
             }
+        admission = detail
     ok = _ollama.warm(model, keep_alive)
     _audit.log_action(action="warm", target=model, kind="ollama", actor=by,
                       force=force, outcome=("ok" if ok else "failed"),
                       detail=f"keep_alive={keep_alive}", cap=_EVENT_CAP)
-    return {
+    result = {
         "ok": ok,
         "model": model,
         "keep_alive": keep_alive,
@@ -373,6 +375,24 @@ def _warm_impl(model: str, keep_alive: str, by: str, force: bool) -> dict:
             else f"Failed to warm '{model}'."
         ),
     }
+    # A PASSED check and a check that could not run are different facts, and only
+    # the refusal path used to carry the verdict — so the "size_unknown" outcome
+    # can_warm reports was unobservable to every caller. It matters because
+    # OllamaClient.tags() returns {} on ANY failure: one timed-out /api/tags
+    # makes EVERY model unknown-sized, and admission control silently degrades
+    # wholesale to "allow". Failing open stays the policy; failing open SILENTLY
+    # does not.
+    if admission is not None:
+        result.update(admission)
+        result["size_verified"] = admission["reason"] == "fits"
+        if ok and admission["reason"] == "size_unknown":
+            result["summary"] += (
+                f" Note: {admission['reserved_mb']} MB is reserved by other "
+                f"sessions ({admission['headroom_mb']} MB headroom), but "
+                f"'{model}' size could not be verified — Ollama did not report "
+                "it, so the fit was NOT checked."
+            )
+    return result
 
 
 @mcp.tool()
@@ -382,6 +402,11 @@ async def warm(model: str, keep_alive: str = "5m", by: str = "unknown",
 
     Refuses when active reservations leave no room for the model — pass
     ``force=True`` to override. ``by`` records the requester in the audit log.
+
+    An allowed warm carries the admission verdict (``reason`` +
+    ``size_verified``): ``size_verified=False`` means the model's size could
+    not be read while reservations were active, so the fit was NOT checked —
+    the load was allowed by fail-open policy, not by passing the check.
     """
     return await _in_thread(_warm_impl, model, keep_alive, by, force)
 
@@ -555,10 +580,17 @@ def _trend_impl(hours: float) -> dict:
     rows.reverse()  # read_events is newest-first; the summarizer needs oldest-first
     summary = _audit.summarize_samples(rows)
     if summary["count"] == 0:
+        # Name every reason a window can be empty, not just the two knobs: a
+        # status call with no GPU rows is never sampled either (see
+        # _run_detection), which is the permanent state of a machine whose
+        # nvidia-smi doesn't work — a user told to check the throttle and
+        # VRAM_MCP_AUDIT would be chasing two causes that aren't theirs.
         text = (
-            f"No VRAM samples in the last {hours}h. Samples are recorded on "
-            f"status calls at most once per {_SAMPLE_SECONDS:g}s "
-            "(VRAM_MCP_SAMPLE_SECONDS), and are disabled by VRAM_MCP_AUDIT=0."
+            f"No VRAM samples in the last {hours}h. Samples are recorded only on "
+            f"status calls that returned GPU readings, at most once per "
+            f"{_SAMPLE_SECONDS:g}s (VRAM_MCP_SAMPLE_SECONDS). So: no status call "
+            "in that window, sampling turned off by VRAM_MCP_AUDIT=0, or no "
+            "usable GPU reading to record (nvidia-smi missing or failing)."
         )
     else:
         # "now unknown" rather than a stale number: latest_free_mb describes the

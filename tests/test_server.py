@@ -93,6 +93,62 @@ def test_reserve_tool_surfaces_a_rejected_gb_as_a_structured_error():
     assert "gb" in result["summary"]
 
 
+def test_trend_empty_window_names_missing_gpu_readings_as_a_cause(monkeypatch):
+    """Sampling is skipped whenever a status call has no GPU rows — the case for
+    anyone without a working nvidia-smi. Blaming only the throttle and
+    VRAM_MCP_AUDIT=0 sends that user chasing two causes that aren't theirs."""
+    monkeypatch.setattr(server._audit, "read_events", lambda **kwargs: [])
+    text = server._trend_impl(1.0)["summary"]
+    assert "nvidia-smi" in text
+    assert "VRAM_MCP_AUDIT=0" in text
+
+
+# ---- warm() admission ------------------------------------------------------
+
+@pytest.fixture
+def warm_env(monkeypatch):
+    """A GPU with 20 GB free and one 8 GB reservation held by another session."""
+    monkeypatch.setattr(server._audit, "log_action", lambda **kwargs: None)
+    monkeypatch.setattr(core, "combined_status", lambda *a, **k: {
+        "gpus": [], "loaded": [], "free_mb": 20000, "pressure": {}})
+    monkeypatch.setattr(server, "_active_claims", lambda: (
+        [{"kind": "reservation", "gb": 8, "owner": "trainer", "purpose": "sd"}], True))
+    monkeypatch.setattr(server._ollama, "warm", lambda model, keep_alive: True)
+    return monkeypatch
+
+
+def test_warm_allowed_with_unverifiable_size_says_the_check_was_unverified(warm_env):
+    """tags() returns {} on ANY failure, so a timed-out /api/tags makes EVERY
+    model 'size unknown' and admission control degrades wholesale to allow. That
+    is the deliberate fail-open policy — but a 20 GB model must not sail through
+    an 8 GB reservation reporting a plain success."""
+    warm_env.setattr(server._ollama, "tags", lambda: {})
+    result = server._warm_impl("qwen3:32b", "5m", "tester", False)
+    assert result["ok"] is True
+    assert result["reason"] == "size_unknown"
+    assert result["size_verified"] is False
+    assert "size" in result["summary"] and "8192 MB" in result["summary"]
+
+
+def test_warm_allowed_with_a_verified_size_is_distinguishable(warm_env):
+    warm_env.setattr(server._ollama, "tags", lambda: {"qwen3:32b": 1900})
+    result = server._warm_impl("qwen3:32b", "5m", "tester", False)
+    assert result["ok"] is True
+    assert result["reason"] == "fits"
+    assert result["size_verified"] is True
+    assert "could not be verified" not in result["summary"]
+
+
+def test_warm_forced_reports_no_admission_verdict(warm_env):
+    """force=True skips the check entirely; claiming a size was verified (or
+    wasn't) would describe a check that never ran."""
+    warm_env.setattr(server._ollama, "tags", lambda: {})
+    result = server._warm_impl("qwen3:32b", "5m", "tester", True)
+    assert result["ok"] is True
+    assert "size_verified" not in result
+    assert "reason" not in result
+
+
 def test_trend_caps_returned_samples(monkeypatch):
     """trend() output lands in an agent's context window; 10k raw rows would
     flood it. The summary still covers every row."""

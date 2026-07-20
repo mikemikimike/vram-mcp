@@ -15,6 +15,9 @@ from ._util import bytes_to_mb as _shared_bytes_to_mb
 
 _MB_PER_GB = 1024
 
+SPILL_THRESHOLD_MB = 256   # below this, non-local usage is normal desktop noise
+TIGHT_MB = 1024
+
 
 def _bytes_to_mb(value) -> int:
     """Bytes -> whole MB; 0 for missing/garbage (a number is always expected here)."""
@@ -117,14 +120,78 @@ def other_processes(nvml_processes_fn, exclude_pids: set) -> list[dict]:
     return [p for p in nvml_processes_fn() if p["pid"] not in exclude_pids]
 
 
+def pressure(gpus: list[dict], loaded: list[dict], other_processes: list[dict],
+             *, spill_threshold_mb: int = SPILL_THRESHOLD_MB,
+             tight_mb: int = TIGHT_MB) -> dict:
+    """Classify how close the GPU is to a slow-mode, and which one.
+
+    Two independent degradations exist and must not be conflated:
+
+    * **Driver-forced spill** — WDDM demand-pages VRAM to system RAM under
+      pressure (``non_local_mb``). This is the severe multi-x slowdown.
+    * **Deliberate CPU offload** — Ollama chose to put layers on the CPU
+      backend up front (``offloaded_to_cpu``). Slower, but a considered
+      placement, not paging.
+
+    Returns ``{"state", "free_mb", "non_local_mb", "spilling",
+    "offloaded_models", "detail"}``. ``state`` is the first match of
+    thrashing > degraded > tight > ok.
+    """
+    free_mb = _gpu.max_free_mb(gpus)
+    non_local_mb = sum(
+        p.get("non_local_mb") or 0
+        for p in other_processes if isinstance(p, dict)
+    )
+    spilling = non_local_mb >= spill_threshold_mb
+    offloaded = [
+        m["name"] for m in loaded
+        if isinstance(m, dict) and m.get("offloaded_to_cpu") and m.get("name")
+    ]
+
+    if spilling:
+        state = "thrashing"
+        detail = (
+            f"{non_local_mb} MB of VRAM has spilled to system RAM; the driver "
+            "is paging. Expect severe slowdown — free VRAM or reduce load."
+        )
+    elif offloaded:
+        state = "degraded"
+        detail = (
+            f"Model(s) partly on CPU: {', '.join(offloaded)}. Slower than "
+            "full GPU residency, but a deliberate Ollama placement, not paging."
+        )
+    elif free_mb is not None and free_mb < tight_mb:
+        state = "tight"
+        detail = (
+            f"Only {free_mb} MB free; the next load will likely spill or fail."
+        )
+    else:
+        state = "ok"
+        detail = "No VRAM pressure detected."
+
+    return {
+        "state": state,
+        "free_mb": free_mb,
+        "non_local_mb": non_local_mb,
+        "spilling": spilling,
+        "offloaded_models": offloaded,
+        "detail": detail,
+    }
+
+
 def combined_status(
     gpu_status_fn: Callable[[], list[dict]], ollama, *,
     snapshot_fn=None, nvml_processes_fn=None, procinfo_fn=None,
 ) -> dict:
     """Snapshot of GPUs + loaded models + best free VRAM.
 
-    Returns ``{"gpus": [...], "loaded": [...], "free_mb": int | None}``, plus
-    ``"other_processes"`` when ``nvml_processes_fn`` or ``procinfo_fn`` is given.
+    Returns ``{"gpus": [...], "loaded": [...], "free_mb": int | None,
+    "pressure": {...}}``, plus ``"other_processes"`` when ``nvml_processes_fn``
+    or ``procinfo_fn`` is given. ``pressure`` is ALWAYS present: it is computed
+    from the process table when one is available (driver-spill detection needs
+    ``non_local_mb``, which only that table carries) and from the GPU + model
+    data alone otherwise — in which case it can still report ``degraded``/
+    ``tight``/``ok``, just never ``thrashing``.
     Each loaded model always carries ``total_size_mb``/``offloaded_to_cpu``; when
     ``snapshot_fn`` (``() -> Snapshot``) is given it also carries ``claims``
     and ``busy``, all derived from ONE snapshot capture rather than per-model
@@ -145,8 +212,11 @@ def combined_status(
         "free_mb": _gpu.max_free_mb(gpus),
     }
     source = procinfo_fn if procinfo_fn is not None else nvml_processes_fn
+    procs: list[dict] = []
     if source is not None:
-        result["other_processes"] = other_processes(source, resolved_pids)
+        procs = other_processes(source, resolved_pids)
+        result["other_processes"] = procs
+    result["pressure"] = pressure(gpus, loaded, procs)
     return result
 
 

@@ -169,6 +169,62 @@ def test_other_processes_excludes_known_ollama_pids():
     assert result == [{"pid": 200, "size_mb": 300, "kind": "graphics"}]
 
 
+# ---- pressure ---------------------------------------------------------------
+
+GPUS_OK = [{"index": 0, "total_mb": 24576, "used_mb": 4000, "free_mb": 20576}]
+GPUS_TIGHT = [{"index": 0, "total_mb": 24576, "used_mb": 24400, "free_mb": 176}]
+
+
+def test_pressure_ok():
+    p = core.pressure(GPUS_OK, [], [])
+    assert p["state"] == "ok"
+    assert p["spilling"] is False
+    assert p["non_local_mb"] == 0
+
+
+def test_pressure_tight_when_free_low():
+    assert core.pressure(GPUS_TIGHT, [], [])["state"] == "tight"
+
+
+def test_pressure_degraded_on_cpu_offload():
+    loaded = [{"name": "qwen3:32b", "offloaded_to_cpu": True}]
+    p = core.pressure(GPUS_OK, loaded, [])
+    assert p["state"] == "degraded"
+    assert p["offloaded_models"] == ["qwen3:32b"]
+
+
+def test_pressure_thrashing_beats_degraded():
+    loaded = [{"name": "qwen3:32b", "offloaded_to_cpu": True}]
+    procs = [{"pid": 1, "non_local_mb": 4096}]
+    p = core.pressure(GPUS_TIGHT, loaded, procs)
+    assert p["state"] == "thrashing"
+    assert p["spilling"] is True
+    assert p["non_local_mb"] == 4096
+
+
+def test_pressure_ignores_noise_below_threshold():
+    procs = [{"pid": 1, "non_local_mb": 10}, {"pid": 2, "non_local_mb": 20}]
+    p = core.pressure(GPUS_OK, [], procs)
+    assert p["non_local_mb"] == 30
+    assert p["spilling"] is False
+    assert p["state"] == "ok"
+
+
+def test_pressure_tolerates_none_values():
+    procs = [{"pid": 1, "non_local_mb": None}, {"pid": 2}]
+    p = core.pressure([{"index": 0, "free_mb": None}], [{"name": None}], procs)
+    assert p["non_local_mb"] == 0
+    assert p["free_mb"] is None
+    assert p["state"] == "ok"
+
+
+def test_combined_status_includes_pressure():
+    status = core.combined_status(
+        lambda: GPUS_OK, FakeOllama([]), procinfo_fn=lambda: [],
+    )
+    assert status["pressure"]["state"] == "ok"
+
+
 # ---- combined_status full wiring -------------------------------------------------
 
 def test_combined_status_full_wiring():

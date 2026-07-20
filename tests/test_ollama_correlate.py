@@ -411,3 +411,25 @@ def test_resolve_tag_tagged_name_never_falls_back_to_latest():
     # of a different size; a wrong size is worse than an unknown one.
     known = {"qwen3:latest": 5000}
     assert oc.resolve_tag("qwen3:32b", known) is None
+
+
+def test_resolve_tag_registry_host_with_a_port_is_not_a_tag():
+    # A colon in the REGISTRY HOST is not a tag: only the part after the last
+    # "/" can carry one (same rule _tag_name_from_manifest_parts builds names
+    # by). Reading "localhost:5000/library/foo" as already-tagged skipped the
+    # :latest fallback and reported the model's size as unknown.
+    known = {"localhost:5000/library/foo:latest": 4096}
+    assert oc.resolve_tag("localhost:5000/library/foo",
+                          known) == "localhost:5000/library/foo:latest"
+
+
+def test_resolve_tag_non_official_registry_name_resolves_to_latest():
+    known = {"hf.co/NousResearch/Hermes-4.3-36B-GGUF:latest": 21000}
+    assert oc.resolve_tag(
+        "hf.co/NousResearch/Hermes-4.3-36B-GGUF",
+        known) == "hf.co/NousResearch/Hermes-4.3-36B-GGUF:latest"
+
+
+def test_resolve_tag_tagged_name_under_a_ported_host_stays_tagged():
+    known = {"localhost:5000/library/foo:latest": 4096}
+    assert oc.resolve_tag("localhost:5000/library/foo:q4", known) is None

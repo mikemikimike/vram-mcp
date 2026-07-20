@@ -169,12 +169,19 @@ def resolve_tag(model: str, known) -> Optional[str]:
     A name that ALREADY carries a tag never falls back to ``:latest``:
     ``qwen3:32b`` and ``qwen3:latest`` are different models of different sizes,
     and a wrong size is worse than an unknown one.
+
+    "Already tagged" is decided from the part after the LAST ``/``, the only
+    place a tag can legally appear — the same name shape
+    :func:`_tag_name_from_manifest_parts` builds. A colon earlier in the name
+    belongs to a registry host's port (``localhost:5000/library/foo``), and
+    reading that as a tag skipped the ``:latest`` fallback for every
+    self-hosted-registry model.
     """
     if not model:
         return None
     if model in known:
         return model
-    if ":" not in model:
+    if ":" not in model.rsplit("/", 1)[-1]:
         latest = f"{model}:latest"
         if latest in known:
             return latest

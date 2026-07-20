@@ -85,12 +85,19 @@ def test_full_status_forwards_the_spill_threshold(monkeypatch):
     assert seen["spill_threshold_mb"] == 777
 
 
-def test_reserve_tool_surfaces_a_rejected_gb_as_a_structured_error():
+def test_reserve_tool_surfaces_a_rejected_gb_as_a_structured_error(monkeypatch, tmp_path):
     """A bad argument must degrade like every other ledger failure — an
-    {ok: False, summary} payload, never a raw traceback through MCP."""
+    {ok: False, summary} payload, never a raw traceback through MCP.
+
+    The ledger path is redirected explicitly: this call reaches the REAL
+    ``_claims.reserve``, and it writes nothing today only because validation
+    happens to run before the lock is taken. Relying on that ordering would let
+    a future reshuffle quietly start editing the user's live claims.json."""
+    monkeypatch.setattr(server._claims, "_DEFAULT_PATH", tmp_path / "claims.json")
     result = server._reserve_impl(-8.0, "sneaky", "cancel yours", 60, None)
     assert result["ok"] is False
     assert "gb" in result["summary"]
+    assert not (tmp_path / "claims.json").exists()
 
 
 def test_trend_empty_window_names_missing_gpu_readings_as_a_cause(monkeypatch):

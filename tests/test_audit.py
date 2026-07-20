@@ -171,3 +171,113 @@ def test_detect_second_session_does_not_double_log(tmp_path):
     audit.detect_and_log([], last_seen_path=ls, log_path=log, now_fn=clk)  # session A logs it
     again = audit.detect_and_log([], last_seen_path=ls, log_path=log, now_fn=clk)  # session B
     assert again == []  # already gone from last_seen -> nothing to re-log
+
+
+def _sample(free_mb=1000, state="ok"):
+    return {"free_mb": free_mb, "used_mb": 23000, "total_mb": 24576,
+            "non_local_mb": 0, "state": state, "loaded_count": 1}
+
+
+def test_first_sample_is_always_written(tmp_path):
+    log, state = tmp_path / "e.jsonl", tmp_path / "s.json"
+    now = datetime(2026, 7, 19, 12, 0, 0, tzinfo=timezone.utc)
+    assert audit.maybe_log_sample(
+        _sample(), state_path=state, log_path=log, now_fn=lambda: now) is True
+    rows = audit.read_events(type="sample", path=log)
+    assert len(rows) == 1
+    assert rows[0]["free_mb"] == 1000
+
+
+def test_sample_throttled_within_interval(tmp_path):
+    log, state = tmp_path / "e.jsonl", tmp_path / "s.json"
+    t0 = datetime(2026, 7, 19, 12, 0, 0, tzinfo=timezone.utc)
+    audit.maybe_log_sample(_sample(), state_path=state, log_path=log,
+                           now_fn=lambda: t0, interval_seconds=60)
+    t1 = t0 + timedelta(seconds=30)
+    assert audit.maybe_log_sample(
+        _sample(), state_path=state, log_path=log,
+        now_fn=lambda: t1, interval_seconds=60) is False
+    assert len(audit.read_events(type="sample", path=log)) == 1
+
+
+def test_sample_written_after_interval(tmp_path):
+    log, state = tmp_path / "e.jsonl", tmp_path / "s.json"
+    t0 = datetime(2026, 7, 19, 12, 0, 0, tzinfo=timezone.utc)
+    audit.maybe_log_sample(_sample(), state_path=state, log_path=log,
+                           now_fn=lambda: t0, interval_seconds=60)
+    t1 = t0 + timedelta(seconds=61)
+    assert audit.maybe_log_sample(
+        _sample(free_mb=200), state_path=state, log_path=log,
+        now_fn=lambda: t1, interval_seconds=60) is True
+    assert len(audit.read_events(type="sample", path=log)) == 2
+
+
+def test_corrupt_state_file_treated_as_never_sampled(tmp_path):
+    log, state = tmp_path / "e.jsonl", tmp_path / "s.json"
+    state.write_text("{not json", encoding="utf-8")
+    now = datetime(2026, 7, 19, 12, 0, 0, tzinfo=timezone.utc)
+    assert audit.maybe_log_sample(
+        _sample(), state_path=state, log_path=log, now_fn=lambda: now) is True
+
+
+def _boom(*_a, **_k):
+    raise OSError("disk on fire")
+
+
+def test_maybe_log_sample_never_raises_on_state_write_failure(tmp_path, monkeypatch):
+    # A failing state write must degrade to "no sample", never to an exception:
+    # the audit may never break a tool call.
+    monkeypatch.setattr(audit, "save_json_atomic", _boom)
+    assert audit.maybe_log_sample(
+        _sample(), state_path=tmp_path / "s.json",
+        log_path=tmp_path / "e.jsonl") is False
+
+
+def test_maybe_log_sample_never_raises_on_event_append_failure(tmp_path, monkeypatch):
+    # Same contract on the far side of the throttle: the events append is the
+    # second, independently-locked write and it can fail on its own.
+    monkeypatch.setattr(audit, "append_jsonl_capped", _boom)
+    assert audit.maybe_log_sample(
+        _sample(), state_path=tmp_path / "s.json",
+        log_path=tmp_path / "e.jsonl") is False
+
+
+def test_maybe_log_sample_never_raises_on_a_non_mapping_sample(tmp_path):
+    # ``**sample`` is the one unguarded-looking expression in the function; a
+    # caller passing garbage must still not break the tool call.
+    assert audit.maybe_log_sample(
+        None, state_path=tmp_path / "s.json",
+        log_path=tmp_path / "e.jsonl") is False
+
+
+def test_maybe_log_sample_survives_a_directory_where_the_state_file_belongs(tmp_path):
+    # Windows os.replace happily renames a directory when the destination is
+    # free, so load_json quarantines it aside and the write actually succeeds.
+    # The contract under test is only that we return a bool instead of raising.
+    state = tmp_path / "s.json"
+    state.mkdir()
+    result = audit.maybe_log_sample(
+        _sample(), state_path=state, log_path=tmp_path / "e.jsonl")
+    assert isinstance(result, bool)
+
+
+def test_summarize_samples_reports_falling_trend():
+    rows = [{"free_mb": v, "state": "ok"} for v in (9000, 8000, 3000, 1000)]
+    s = audit.summarize_samples(rows)
+    assert s["direction"] == "falling"
+    assert s["min_free_mb"] == 1000
+    assert s["max_free_mb"] == 9000
+    assert s["latest_free_mb"] == 1000
+    assert s["count"] == 4
+
+
+def test_summarize_samples_counts_spilling():
+    rows = [{"free_mb": 100, "state": "thrashing"},
+            {"free_mb": 100, "state": "ok"},
+            {"free_mb": 100, "state": "thrashing"}]
+    assert audit.summarize_samples(rows)["thrashing_samples"] == 2
+
+
+def test_summarize_samples_handles_empty_and_none():
+    assert audit.summarize_samples([])["count"] == 0
+    assert audit.summarize_samples([{"free_mb": None}])["direction"] == "unknown"

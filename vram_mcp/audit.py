@@ -16,6 +16,8 @@ from ._util import append_jsonl_capped, iso, load_json, locked, parse_iso, read_
 
 DEFAULT_EVENTS_PATH = Path.home() / ".cache" / "vram-mcp" / "events.jsonl"
 DEFAULT_LAST_SEEN_PATH = Path.home() / ".cache" / "vram-mcp" / "last_seen.json"
+DEFAULT_SAMPLE_PATH = Path.home() / ".cache" / "vram-mcp" / "last_sample.json"
+SAMPLE_INTERVAL_SECONDS = 60.0
 
 _RECENT_ACTION_SECONDS = 10.0
 
@@ -173,3 +175,85 @@ def detect_and_log(current_holders, *, last_seen_path: Path = DEFAULT_LAST_SEEN_
         except Exception:
             pass
     return emitted
+
+
+def maybe_log_sample(sample: dict, *, interval_seconds: float = SAMPLE_INTERVAL_SECONDS,
+                     state_path: Path = DEFAULT_SAMPLE_PATH,
+                     log_path: Path = DEFAULT_EVENTS_PATH,
+                     now_fn=_default_now, cap: int = 5000) -> bool:
+    """Append one ``type="sample"`` event, at most once per ``interval_seconds``
+    across all sessions.
+
+    The throttle matters: ``events.jsonl`` is capped, and an unthrottled sample
+    on every status call would evict the action/disappearance events that carry
+    the real diagnostic value. The last-sample timestamp lives in its own small
+    state file under the shared lock, so concurrent sessions agree on the rate.
+
+    Returns True if a sample was written. Best-effort — never raises.
+    """
+    try:
+        now = now_fn()
+        with locked(state_path):
+            state = load_json(state_path, lambda: {},
+                              lambda d: isinstance(d, dict))
+            last = state.get("ts")
+            if last:
+                try:
+                    if (now - parse_iso(last)).total_seconds() < interval_seconds:
+                        return False
+                except (ValueError, TypeError):
+                    pass  # unparsable timestamp -> treat as never sampled
+            save_json_atomic(state_path, {"ts": iso(now)})
+    except Exception:
+        return False
+    # Appended OUTSIDE the state lock, under the EVENTS lock, so every writer of
+    # events.jsonl is serialized by one lock and none are nested. Building the
+    # event is inside the try too: ``**sample`` raises on a non-mapping, and
+    # nothing here may escape to the caller.
+    try:
+        event = {"ts": iso(now), "type": "sample", **sample}
+        with locked(log_path):
+            append_jsonl_capped(log_path, event, cap)
+    except Exception:
+        return False
+    return True
+
+
+def summarize_samples(rows: list[dict]) -> dict:
+    """Reduce ``type="sample"`` events to a trend. Pure — no IO.
+
+    ``direction`` compares the mean of the first third against the last third,
+    which is robust to a single spike in a way that first-vs-last is not. Rows
+    are expected oldest-first.
+    """
+    values = [r.get("free_mb") for r in rows
+              if isinstance(r, dict) and isinstance(r.get("free_mb"), int)]
+    thrashing = sum(1 for r in rows
+                    if isinstance(r, dict) and r.get("state") == "thrashing")
+    if not values:
+        return {"count": len(rows), "direction": "unknown",
+                "min_free_mb": None, "max_free_mb": None,
+                "latest_free_mb": None, "thrashing_samples": thrashing}
+
+    third = max(1, len(values) // 3)
+    head = sum(values[:third]) / third
+    tail = sum(values[-third:]) / third
+    delta = tail - head
+    # 10% of the starting level, floored at 128 MB, so ordinary jitter on a
+    # quiet GPU doesn't read as a trend.
+    threshold = max(128.0, abs(head) * 0.10)
+    if delta <= -threshold:
+        direction = "falling"
+    elif delta >= threshold:
+        direction = "rising"
+    else:
+        direction = "flat"
+
+    return {
+        "count": len(rows),
+        "direction": direction,
+        "min_free_mb": min(values),
+        "max_free_mb": max(values),
+        "latest_free_mb": values[-1],
+        "thrashing_samples": thrashing,
+    }

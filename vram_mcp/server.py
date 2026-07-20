@@ -17,6 +17,7 @@ from __future__ import annotations
 import functools
 import os
 
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import anyio.to_thread
@@ -25,6 +26,7 @@ from mcp.server.fastmcp import FastMCP
 from . import claims as _claims
 from . import core
 from . import nvml as _nvml
+from ._util import iso
 from .gpu import gpu_status
 from .ollama import OllamaClient
 from .ollama_correlate import runner_pid_map
@@ -40,6 +42,7 @@ from . import procinfo as _procinfo
 _AUDIT_ON = os.environ.get("VRAM_MCP_AUDIT", "1") != "0"
 _MEANINGFUL_MB = int(os.environ.get("VRAM_MCP_MEANINGFUL_MB", "512"))
 _EVENT_CAP = int(os.environ.get("VRAM_MCP_EVENT_CAP", "5000"))
+_SAMPLE_SECONDS = float(os.environ.get("VRAM_MCP_SAMPLE_SECONDS", "60"))
 
 
 def _procinfo_table() -> list:
@@ -53,15 +56,34 @@ def _procinfo_table() -> list:
 
 
 def _run_detection(status: dict) -> None:
-    """Diff the meaningful-holder set from a status snapshot and log changes.
+    """Diff the meaningful-holder set from a status snapshot and log changes,
+    then record a throttled free-VRAM sample for ``trend``.
+
     Best-effort; disabled by VRAM_MCP_AUDIT=0 — never raises (the audit may
-    never break a tool call)."""
+    never break a tool call). The two halves are guarded independently so a
+    sampling failure can't suppress detection, or vice versa."""
     if not _AUDIT_ON:
         return
     try:
         holders = _audit.meaningful_holders(
             status.get("loaded", []), status.get("other_processes", []), _MEANINGFUL_MB)
         _audit.detect_and_log(holders, cap=_EVENT_CAP)
+    except Exception:
+        pass
+    try:
+        p = status.get("pressure") or {}
+        gpus = status.get("gpus") or []
+        _audit.maybe_log_sample(
+            {
+                "free_mb": p.get("free_mb"),
+                "used_mb": sum(g.get("used_mb") or 0 for g in gpus),
+                "total_mb": sum(g.get("total_mb") or 0 for g in gpus),
+                "non_local_mb": p.get("non_local_mb"),
+                "state": p.get("state"),
+                "loaded_count": len(status.get("loaded", [])),
+            },
+            interval_seconds=_SAMPLE_SECONDS, cap=_EVENT_CAP,
+        )
     except Exception:
         pass
 
@@ -76,6 +98,24 @@ def _snapshot() -> core.Snapshot:
     return core.Snapshot.capture(
         _claims.list_claims, runner_pid_map, _nvml.nvml_busy_map,
     )
+
+
+def _active_claims() -> tuple[list, bool]:
+    """The ledger's active records for a read-only admission decision, plus
+    whether the read actually succeeded.
+
+    FAILS OPEN by design. ``list_claims`` is lock-free and swallows most IO
+    errors, but a pathological filesystem state can still surface a
+    TimeoutError/OSError, and the alternative — refusing to warm because a
+    small JSON file was momentarily unreadable — is the worse failure: the
+    user's GPU is idle, the refusal is inexplicable to them, and reservations
+    were only ever cooperative advice in the first place. Warming past a
+    reservation we couldn't read is recoverable; a GPU nobody can use is not.
+    Callers get ``ok=False`` so they can say "unknown" rather than "zero"."""
+    try:
+        return _claims.list_claims(), True
+    except (TimeoutError, OSError):
+        return [], False
 
 
 def _full_status() -> dict:
@@ -99,9 +139,17 @@ def _vram_status_impl() -> dict:
     _run_detection(status)
     n_gpu = len(status["gpus"])
     n_loaded = len(status["loaded"])
+    p = status.get("pressure") or {}
+    state = p.get("state", "unknown")
+    # The pressure detail is the actionable half ("X MB has spilled to system
+    # RAM"), so surface it inline rather than making the caller dig into the
+    # payload — but only when there's something to say, and only via .get() so
+    # a partial pressure dict can never turn a status call into an exception.
+    detail = p.get("detail")
     status["summary"] = (
         f"{n_gpu} GPU(s), {n_loaded} model(s) loaded, "
-        f"free: {_fmt_free(status['free_mb'])}."
+        f"free: {_fmt_free(status['free_mb'])}, pressure: {state}."
+        + (f" {detail}" if detail and state not in ("ok", "unknown") else "")
     )
     return status
 
@@ -112,8 +160,10 @@ async def vram_status() -> dict:
 
     Returns per-GPU totals, the list of resident models (each with claim
     attribution, a best-effort busy signal, and CPU-offload detection), every
-    other VRAM-holding process on the GPU, the best free VRAM, and a
-    human-readable ``summary``.
+    other VRAM-holding process on the GPU, the best free VRAM, a ``pressure``
+    dict (state ok|tight|degraded|thrashing, separating driver-forced spill to
+    system RAM from Ollama's deliberate CPU offload), and a human-readable
+    ``summary``.
     """
     return await _in_thread(_vram_status_impl)
 
@@ -196,6 +246,11 @@ def _ensure_free_impl(gb: float, force: bool, by: str) -> dict:
         gb, gpu_status, _ollama, settle=0.5, force=force,
         snapshot_fn=_snapshot,
     )
+    active, ledger_ok = _active_claims()
+    reserved = core.reserved_mb(active)
+    # None, not 0, when the ledger couldn't be read — "we don't know" and
+    # "nothing is reserved" lead to opposite decisions.
+    result["reserved_mb"] = reserved if ledger_ok else None
     for name in result["unloaded"]:
         _audit.log_action(action="ensure_free", target=name, kind="ollama",
                           actor=by, force=force, outcome="ok",
@@ -222,21 +277,66 @@ def _ensure_free_impl(gb: float, force: bool, by: str) -> dict:
     if result["declined"]:
         names = ", ".join(d["name"] for d in result["declined"])
         declined_note = f" Protected (force=True to override): {names}."
-    result["summary"] = base + declined_note
+    # Freed VRAM isn't necessarily *yours*: another session may have reserved
+    # part of it for non-Ollama work, and it won't show up as a loaded model.
+    if not ledger_ok:
+        reserved_note = (
+            " Note: the claim ledger could not be read, so how much of the "
+            "free VRAM is reserved by other sessions is unknown."
+        )
+    elif reserved:
+        reserved_note = (
+            f" Note: {reserved} MB of the free VRAM is reserved by other sessions."
+        )
+    else:
+        reserved_note = ""
+    result["summary"] = base + declined_note + reserved_note
     return result
 
 
 @mcp.tool()
 async def ensure_free(gb: float, force: bool = False, by: str = "unknown") -> dict:
     """Free VRAM until at least ``gb`` GB is available. Skips claimed/busy models
-    unless ``force=True``. ``by`` records the requester in the audit log."""
+    unless ``force=True``. ``by`` records the requester in the audit log.
+
+    Also reports ``reserved_mb`` — how much of the resulting free VRAM other
+    sessions have reserved for non-Ollama work (``None`` if unreadable)."""
     return await _in_thread(_ensure_free_impl, gb, force, by)
 
 
-def _warm_impl(model: str, keep_alive: str, by: str) -> dict:
+def _warm_impl(model: str, keep_alive: str, by: str, force: bool) -> dict:
+    if not force:
+        status = core.combined_status(gpu_status, _ollama)
+        # Fails open (see _active_claims): an unreadable ledger reads as "no
+        # reservations", so the warm proceeds rather than being refused for a
+        # reason the user can neither see nor fix.
+        active, _ = _active_claims()
+        reserved = core.reserved_mb(active)
+        allowed, detail = core.can_warm(
+            model, free_mb=status["free_mb"], reserved_mb=reserved,
+            model_size_mb=_ollama.tags().get(model),
+        )
+        if not allowed:
+            _audit.log_action(action="warm", target=model, kind="ollama",
+                              actor=by, force=False, outcome="refused",
+                              detail=f"reserved {reserved} MB ({detail['reason']})",
+                              cap=_EVENT_CAP)
+            owners = ", ".join(
+                f"{r.get('owner')} ({r.get('gb')} GB, {r.get('purpose')})"
+                for r in active if r.get("kind") == "reservation"
+            )
+            return {
+                "ok": False, "model": model, "refused": True, **detail,
+                "reservations": owners,
+                "summary": (
+                    f"Refused to warm '{model}': {reserved} MB of VRAM is "
+                    f"reserved [{owners}] leaving {detail['headroom_mb']} MB "
+                    "headroom. Pass force=True to override."
+                ),
+            }
     ok = _ollama.warm(model, keep_alive)
     _audit.log_action(action="warm", target=model, kind="ollama", actor=by,
-                      force=False, outcome=("ok" if ok else "failed"),
+                      force=force, outcome=("ok" if ok else "failed"),
                       detail=f"keep_alive={keep_alive}", cap=_EVENT_CAP)
     return {
         "ok": ok,
@@ -251,10 +351,14 @@ def _warm_impl(model: str, keep_alive: str, by: str) -> dict:
 
 
 @mcp.tool()
-async def warm(model: str, keep_alive: str = "5m", by: str = "unknown") -> dict:
+async def warm(model: str, keep_alive: str = "5m", by: str = "unknown",
+               force: bool = False) -> dict:
     """Load/pin a model into VRAM for ``keep_alive`` (e.g. ``"5m"``, ``"1h"``).
-    ``by`` records the requester in the audit log."""
-    return await _in_thread(_warm_impl, model, keep_alive, by)
+
+    Refuses when active reservations leave no room for the model — pass
+    ``force=True`` to override. ``by`` records the requester in the audit log.
+    """
+    return await _in_thread(_warm_impl, model, keep_alive, by, force)
 
 
 # ── claim tools ──────────────────────────────────────────────────────────────
@@ -299,6 +403,42 @@ async def claim(model: str, owner: str, purpose: str, ttl_seconds: int = 3600) -
     permanently-stuck claim.
     """
     return await _in_thread(_claim_impl, model, owner, purpose, ttl_seconds)
+
+
+def _reserve_impl(gb: float, owner: str, purpose: str, ttl_seconds: int,
+                  pid: Optional[int]) -> dict:
+    # _ledger_call applies fn(*args) positionally, but reserve's `pid` is
+    # keyword-only — so hand it a zero-arg lambda instead of the bare function.
+    outcome = _ledger_call(
+        "Reserve",
+        lambda: _claims.reserve(gb, owner, purpose, ttl_seconds, pid=pid),
+    )
+    if "error" in outcome:
+        return outcome["error"]
+    result = outcome["result"]
+    result["ok"] = True
+    result["summary"] = (
+        f"Reserved {gb} GB for {owner} ({purpose}), expires "
+        f"{result['expires_at']}. Other sessions' warm() calls will be refused "
+        "when this reservation leaves no headroom."
+    )
+    return result
+
+
+@mcp.tool()
+async def reserve(gb: float, owner: str, purpose: str, ttl_seconds: int = 3600,
+                  pid: Optional[int] = None) -> dict:
+    """Reserve ``gb`` GB of VRAM — a claim on capacity, not on a named model.
+
+    Use this for non-Ollama GPU work (a training run, a diffusion job) so other
+    sessions can see the VRAM is spoken for. ``pid`` is advisory. Reservations
+    expire by TTL like claims, so a crashed session never leaves one stuck.
+
+    COOPERATIVE: this gates vram-mcp's own ``warm()``, but vram-mcp cannot
+    intercept an Ollama auto-load triggered by a direct /api/generate call
+    from another process.
+    """
+    return await _in_thread(_reserve_impl, gb, owner, purpose, ttl_seconds, pid)
 
 
 def _renew_impl(claim_id: str, ttl_seconds: Optional[int]) -> dict:
@@ -378,6 +518,40 @@ async def history(model: str | None = None, type: str | None = None,
     Filter by ``model``, ``type`` (action|disappeared|appeared), ``limit``, or an
     ISO ``since`` floor. Answers 'what happened to model X?'."""
     return await _in_thread(_history_impl, model, type, limit, since)
+
+
+def _trend_impl(hours: float) -> dict:
+    since = iso(datetime.now(timezone.utc) - timedelta(hours=hours))
+    rows = _audit.read_events(type="sample", limit=10_000, since=since)
+    rows.reverse()  # read_events is newest-first; the summarizer needs oldest-first
+    summary = _audit.summarize_samples(rows)
+    if summary["count"] == 0:
+        text = (
+            f"No VRAM samples in the last {hours}h. Samples are recorded on "
+            f"status calls at most once per {_SAMPLE_SECONDS:g}s "
+            "(VRAM_MCP_SAMPLE_SECONDS), and are disabled by VRAM_MCP_AUDIT=0."
+        )
+    else:
+        text = (
+            f"{summary['count']} sample(s) over {hours}h: free VRAM is "
+            f"{summary['direction']} (min {summary['min_free_mb']} MB, "
+            f"max {summary['max_free_mb']} MB, now "
+            f"{summary['latest_free_mb']} MB); "
+            f"{summary['thrashing_samples']} sample(s) showed VRAM spilling "
+            "to system RAM."
+        )
+    return {**summary, "hours": hours, "samples": rows, "summary": text}
+
+
+@mcp.tool()
+async def trend(hours: float = 1.0) -> dict:
+    """Free-VRAM trend over the last ``hours``, from the sampled audit log.
+
+    Answers "was this a gradual erosion or a sudden spike?" — the question a
+    point-in-time ``vram_status()`` cannot. Returns direction, min/max/latest
+    free MB, how many samples showed driver spill, and the raw samples.
+    """
+    return await _in_thread(_trend_impl, hours)
 
 
 def main() -> None:

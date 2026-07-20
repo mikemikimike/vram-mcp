@@ -159,13 +159,11 @@ def test_attach_coordination_nameless_row_stays_unattributed():
 # ---- other_processes ------------------------------------------------------------
 
 def test_other_processes_excludes_known_ollama_pids():
-    def nvml_processes_fn():
-        return [
-            {"pid": 100, "size_mb": 500, "kind": "compute"},
-            {"pid": 200, "size_mb": 300, "kind": "graphics"},
-        ]
-
-    result = core.other_processes(nvml_processes_fn, exclude_pids={100})
+    procs = [
+        {"pid": 100, "size_mb": 500, "kind": "compute"},
+        {"pid": 200, "size_mb": 300, "kind": "graphics"},
+    ]
+    result = core.other_processes(procs, exclude_pids={100})
     assert result == [{"pid": 200, "size_mb": 300, "kind": "graphics"}]
 
 
@@ -263,6 +261,47 @@ def test_combined_status_other_processes_from_procinfo():
         {"pid": 999, "size_mb": 14492, "name": "python.exe",
          "cmdline": "python train.py", "kind": "compute"},
     ]
+
+
+def test_pressure_sees_ollama_runner_spill():
+    """The runner is filtered out of other_processes but MUST still count
+    toward spill: it is the biggest holder and the thing that actually spills."""
+    calls = []
+
+    def source():
+        calls.append(1)
+        return [{"pid": 999, "size_mb": 20000, "non_local_mb": 4096},
+                {"pid": 111, "size_mb": 100, "non_local_mb": 0}]
+
+    status = core.combined_status(
+        lambda: [{"index": 0, "total_mb": 24576, "used_mb": 24000, "free_mb": 576}],
+        FakeOllama([{"name": "m", "size": 1, "size_vram": 1}]),
+        snapshot_fn=lambda: _snap(pid_map={"m": 999}),
+        procinfo_fn=source,
+    )
+    assert status["pressure"]["non_local_mb"] == 4096
+    assert status["pressure"]["state"] == "thrashing"
+    # the runner is still excluded from the "other processes" view
+    assert [p["pid"] for p in status["other_processes"]] == [111]
+    # and the expensive source was sampled exactly once
+    assert len(calls) == 1
+
+
+def test_combined_status_forwards_spill_threshold():
+    """A caller-supplied spill threshold must reach pressure(); the same
+    non-local MB is a verdict either way depending on the knob."""
+    procs = [{"pid": 7, "size_mb": 900, "non_local_mb": 300}]
+    loud = core.combined_status(
+        lambda: GPUS_OK, FakeOllama([]), procinfo_fn=lambda: list(procs),
+        spill_threshold_mb=4096,
+    )
+    assert loud["pressure"]["spilling"] is False
+    quiet = core.combined_status(
+        lambda: GPUS_OK, FakeOllama([]), procinfo_fn=lambda: list(procs),
+        spill_threshold_mb=128,
+    )
+    assert quiet["pressure"]["spilling"] is True
+    assert quiet["pressure"]["state"] == "thrashing"
 
 
 def test_combined_status_skips_snapshot_when_nothing_loaded():
@@ -409,6 +448,15 @@ def test_reserved_mb_empty():
     assert core.reserved_mb([]) == 0
 
 
+def test_reserved_mb_ignores_non_positive_gb():
+    """A hand-edited (or hostile) ledger must not let one record cancel
+    another's reservation — the total is only ever a floor, never negative."""
+    recs = [{"kind": "reservation", "gb": 8.0},
+            {"kind": "reservation", "gb": -8.0},
+            {"kind": "reservation", "gb": 0}]
+    assert core.reserved_mb(recs) == 8192
+
+
 # ---- can_warm ----------------------------------------------------------------
 
 def test_can_warm_allows_when_it_fits():
@@ -434,9 +482,18 @@ def test_can_warm_refuses_when_headroom_exhausted_and_size_unknown():
 
 
 def test_can_warm_allows_unknown_size_with_headroom():
-    ok, _ = core.can_warm("mystery", free_mb=20000, reserved_mb=1024,
-                          model_size_mb=None)
+    # Allowed, but the reason must NOT claim a size check happened — a caller
+    # has to be able to tell a verified fit from an unverified one.
+    ok, detail = core.can_warm("mystery", free_mb=20000, reserved_mb=1024,
+                               model_size_mb=None)
     assert ok is True
+    assert detail["reason"] == "size_unknown"
+
+
+def test_can_warm_reason_fits_only_when_size_was_checked():
+    _, detail = core.can_warm("llama3", free_mb=20000, reserved_mb=8192,
+                              model_size_mb=4096)
+    assert detail["reason"] == "fits"
 
 
 def test_can_warm_allows_when_free_unknown():

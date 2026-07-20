@@ -115,9 +115,18 @@ def attach_coordination(loaded: list[dict], snap: Snapshot) -> tuple[list[dict],
     return out, resolved
 
 
-def other_processes(nvml_processes_fn, exclude_pids: set) -> list[dict]:
-    """Every NVML-visible VRAM holder that isn't an already-listed Ollama model."""
-    return [p for p in nvml_processes_fn() if p["pid"] not in exclude_pids]
+def other_processes(process_table: list[dict], exclude_pids: set) -> list[dict]:
+    """Every VRAM holder in ``process_table`` that isn't an already-listed
+    Ollama model.
+
+    Takes an already-materialized table rather than the reader function on
+    purpose: the caller samples the (expensive — ~1 s on Windows) source ONCE
+    and feeds the same rows to both this view and ``pressure``. When this
+    function called the reader itself, the filtered list was the only thing
+    anyone had, and the runner's spill silently vanished from the pressure
+    verdict.
+    """
+    return [p for p in process_table if p["pid"] not in exclude_pids]
 
 
 def pressure(gpus: list[dict], loaded: list[dict], other_processes: list[dict],
@@ -182,6 +191,7 @@ def pressure(gpus: list[dict], loaded: list[dict], other_processes: list[dict],
 def combined_status(
     gpu_status_fn: Callable[[], list[dict]], ollama, *,
     snapshot_fn=None, nvml_processes_fn=None, procinfo_fn=None,
+    spill_threshold_mb: int = SPILL_THRESHOLD_MB,
 ) -> dict:
     """Snapshot of GPUs + loaded models + best free VRAM.
 
@@ -199,6 +209,9 @@ def combined_status(
     size_mb/name/cmdline/kind (Task 2's sized+named table); it takes precedence
     over ``nvml_processes_fn``. Omitting the kwargs gives the plain base shape
     (tests, ``advise``).
+
+    ``spill_threshold_mb`` forwards to ``pressure`` (VRAM_MCP_SPILL_MB at the
+    server edge).
     """
     gpus = gpu_status_fn()
     loaded = _loaded_models(ollama)
@@ -212,11 +225,19 @@ def combined_status(
         "free_mb": _gpu.max_free_mb(gpus),
     }
     source = procinfo_fn if procinfo_fn is not None else nvml_processes_fn
-    procs: list[dict] = []
+    # The source is sampled EXACTLY ONCE (a ~1 s Windows perf-counter call) and
+    # the same rows feed both consumers, which need DIFFERENT views:
+    #   * pressure  -> the FULL table. The Ollama runner is normally the biggest
+    #     VRAM holder and the process that actually spills to system RAM, so
+    #     hiding it would blind spill detection precisely when it matters.
+    #   * other_processes -> the runner-filtered view, since those PIDs are
+    #     already reported as model entries.
+    full_table: list[dict] = []
     if source is not None:
-        procs = other_processes(source, resolved_pids)
-        result["other_processes"] = procs
-    result["pressure"] = pressure(gpus, loaded, procs)
+        full_table = source()
+        result["other_processes"] = other_processes(full_table, resolved_pids)
+    result["pressure"] = pressure(gpus, loaded, full_table,
+                                  spill_threshold_mb=spill_threshold_mb)
     return result
 
 
@@ -241,15 +262,24 @@ def reserved_mb(all_claims: list[dict]) -> int:
     ``all_claims`` is the ledger's already-expiry-filtered list, so every
     reservation here is live. Malformed records are skipped rather than
     raising — one unusable record must not break a status call.
+
+    Non-positive sizes are skipped too, even though ``claims.reserve`` already
+    rejects them: the ledger is a plain JSON file anyone can hand-edit, and a
+    negative ``gb`` would SUBTRACT from the total — letting one record cancel
+    another session's reservation. ``not (value > 0)`` also excludes NaN, which
+    would otherwise poison the sum.
     """
     total = 0.0
     for record in all_claims:
         if not isinstance(record, dict) or record.get("kind") != "reservation":
             continue
         try:
-            total += float(record["gb"])
+            value = float(record["gb"])
         except (KeyError, TypeError, ValueError):
             continue
+        if not value > 0:
+            continue
+        total += value
     return int(round(total * _MB_PER_GB))
 
 
@@ -266,7 +296,10 @@ def can_warm(model: str, *, free_mb, reserved_mb: int, model_size_mb) -> tuple[b
     free VRAM always allows.
 
     Returns ``(allowed, detail)`` where detail carries ``reason``,
-    ``headroom_mb``, ``reserved_mb`` and ``model_size_mb``.
+    ``headroom_mb``, ``reserved_mb`` and ``model_size_mb``. ``reason`` never
+    over-claims: ``"fits"`` means the size WAS checked against the headroom,
+    ``"size_unknown"`` means it could not be, so a caller can tell a verified
+    fit from an unverified one.
     """
     base = {"reserved_mb": reserved_mb, "model_size_mb": model_size_mb,
             "free_mb": free_mb}
@@ -281,7 +314,9 @@ def can_warm(model: str, *, free_mb, reserved_mb: int, model_size_mb) -> tuple[b
         return True, {**detail, "reason": "no_reservations"}
     if headroom <= 0:
         return False, {**detail, "reason": "no_headroom"}
-    if model_size_mb is not None and model_size_mb > headroom:
+    if model_size_mb is None:
+        return True, {**detail, "reason": "size_unknown"}
+    if model_size_mb > headroom:
         return False, {**detail, "reason": "insufficient_headroom"}
     return True, {**detail, "reason": "fits"}
 

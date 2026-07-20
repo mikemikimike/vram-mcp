@@ -278,6 +278,20 @@ def test_summarize_samples_counts_spilling():
     assert audit.summarize_samples(rows)["thrashing_samples"] == 2
 
 
+def test_summarize_samples_latest_is_none_when_newest_row_has_no_value():
+    """"now N MB" must describe the NEWEST row, not the newest row that
+    happened to carry a number — otherwise the summary reports a stale value
+    as the current one."""
+    rows = [{"free_mb": 9000, "state": "ok"},
+            {"free_mb": 1000, "state": "ok"},
+            {"free_mb": None, "state": "ok"}]     # newest row, unmeasured
+    s = audit.summarize_samples(rows)
+    assert s["latest_free_mb"] is None
+    assert s["min_free_mb"] == 1000              # min/max still use real values
+    assert s["max_free_mb"] == 9000
+    assert s["count"] == 3
+
+
 def test_summarize_samples_handles_empty_and_none():
     assert audit.summarize_samples([])["count"] == 0
     assert audit.summarize_samples([{"free_mb": None}])["direction"] == "unknown"

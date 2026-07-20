@@ -225,11 +225,20 @@ def summarize_samples(rows: list[dict]) -> dict:
     ``direction`` compares the mean of the first third against the last third,
     which is robust to a single spike in a way that first-vs-last is not. Rows
     are expected oldest-first.
+
+    ``latest_free_mb`` describes the NEWEST row, not the newest row that
+    happened to carry a number: callers render it as "now N MB", and a stale
+    value presented as the current one is a lie, where ``None`` ("unknown") is
+    merely a gap.
     """
     values = [r.get("free_mb") for r in rows
               if isinstance(r, dict) and isinstance(r.get("free_mb"), int)]
     thrashing = sum(1 for r in rows
                     if isinstance(r, dict) and r.get("state") == "thrashing")
+    newest = rows[-1] if rows else None
+    latest = (newest.get("free_mb")
+              if isinstance(newest, dict) and isinstance(newest.get("free_mb"), int)
+              else None)
     if not values:
         return {"count": len(rows), "direction": "unknown",
                 "min_free_mb": None, "max_free_mb": None,
@@ -254,6 +263,6 @@ def summarize_samples(rows: list[dict]) -> dict:
         "direction": direction,
         "min_free_mb": min(values),
         "max_free_mb": max(values),
-        "latest_free_mb": values[-1],
+        "latest_free_mb": latest,
         "thrashing_samples": thrashing,
     }

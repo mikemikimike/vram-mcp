@@ -29,7 +29,7 @@ from . import nvml as _nvml
 from ._util import iso
 from .gpu import gpu_status
 from .ollama import OllamaClient
-from .ollama_correlate import runner_pid_map
+from .ollama_correlate import resolve_tag, runner_pid_map
 
 mcp = FastMCP("vram-mcp")
 
@@ -43,6 +43,10 @@ _AUDIT_ON = os.environ.get("VRAM_MCP_AUDIT", "1") != "0"
 _MEANINGFUL_MB = int(os.environ.get("VRAM_MCP_MEANINGFUL_MB", "512"))
 _EVENT_CAP = int(os.environ.get("VRAM_MCP_EVENT_CAP", "5000"))
 _SAMPLE_SECONDS = float(os.environ.get("VRAM_MCP_SAMPLE_SECONDS", "60"))
+_SPILL_MB = int(os.environ.get("VRAM_MCP_SPILL_MB", str(core.SPILL_THRESHOLD_MB)))
+# trend() output lands in an agent's context window, so the raw rows are capped
+# even though the SUMMARY is always computed over every row in the window.
+_TREND_SAMPLE_CAP = 200
 
 
 def _procinfo_table() -> list:
@@ -61,7 +65,13 @@ def _run_detection(status: dict) -> None:
 
     Best-effort; disabled by VRAM_MCP_AUDIT=0 — never raises (the audit may
     never break a tool call). The two halves are guarded independently so a
-    sampling failure can't suppress detection, or vice versa."""
+    sampling failure can't suppress detection, or vice versa.
+
+    A status WITHOUT GPU rows (``list_loaded`` skips the nvidia-smi spawn on
+    purpose) is never sampled: ``used_mb: 0``/``total_mb: 0`` would record a
+    fiction as fact, and — worse — burn the shared once-per-interval throttle
+    slot, so the next REAL sample from ``vram_status`` would be dropped.
+    Detection still runs; only the sample is skipped."""
     if not _AUDIT_ON:
         return
     try:
@@ -70,9 +80,11 @@ def _run_detection(status: dict) -> None:
         _audit.detect_and_log(holders, cap=_EVENT_CAP)
     except Exception:
         pass
+    gpus = status.get("gpus") or []
+    if not gpus:
+        return
     try:
         p = status.get("pressure") or {}
-        gpus = status.get("gpus") or []
         _audit.maybe_log_sample(
             {
                 "free_mb": p.get("free_mb"),
@@ -124,6 +136,7 @@ def _full_status() -> dict:
         gpu_status, _ollama,
         snapshot_fn=_snapshot,
         procinfo_fn=(_procinfo_table if _AUDIT_ON else _nvml.nvml_processes),
+        spill_threshold_mb=_SPILL_MB,
     )
 
 
@@ -175,6 +188,7 @@ def _list_loaded_impl() -> dict:
     status = core.combined_status(
         lambda: [], _ollama, snapshot_fn=_snapshot,
         procinfo_fn=(_procinfo_table if _AUDIT_ON else None),
+        spill_threshold_mb=_SPILL_MB,
     )
     _run_detection(status)
     loaded = status["loaded"]
@@ -312,9 +326,15 @@ def _warm_impl(model: str, keep_alive: str, by: str, force: bool) -> dict:
         # reason the user can neither see nor fix.
         active, _ = _active_claims()
         reserved = core.reserved_mb(active)
+        # Ollama resolves a bare name to its ":latest" tag, so a raw
+        # tags().get(model) misses on exactly the names users type — and a miss
+        # reads as "size unknown", which walks straight past the
+        # insufficient_headroom refusal this whole feature exists for.
+        sizes = _ollama.tags()
+        tag = resolve_tag(model, sizes)
         allowed, detail = core.can_warm(
             model, free_mb=status["free_mb"], reserved_mb=reserved,
-            model_size_mb=_ollama.tags().get(model),
+            model_size_mb=(sizes.get(tag) if tag is not None else None),
         )
         if not allowed:
             _audit.log_action(action="warm", target=model, kind="ollama",
@@ -374,10 +394,14 @@ def _ledger_call(verb: str, fn, *args) -> dict:
     Returns ``{"result": <fn's return>}`` on success, or ``{"error": {ok:
     false, summary}}`` on an OPERATIONAL failure (live-lock timeout,
     exhausted Windows sharing-violation retries) so every claim tool
-    degrades identically instead of surfacing a raw traceback."""
+    degrades identically instead of surfacing a raw traceback.
+
+    ValueError joins that list: the ledger rejects arguments it must not
+    persist (``reserve(gb=-8)``), and an MCP caller deserves the same readable
+    ``{ok: false, summary}`` for a bad argument as for a busy lock."""
     try:
         return {"result": fn(*args)}
-    except (TimeoutError, OSError) as e:
+    except (TimeoutError, OSError, ValueError) as e:
         return {"error": {"ok": False, "summary": f"{verb} failed: {e}"}}
 
 
@@ -532,15 +556,27 @@ def _trend_impl(hours: float) -> dict:
             "(VRAM_MCP_SAMPLE_SECONDS), and are disabled by VRAM_MCP_AUDIT=0."
         )
     else:
+        # "now unknown" rather than a stale number: latest_free_mb describes the
+        # NEWEST sample, which may carry no reading at all.
+        latest = summary["latest_free_mb"]
+        now_text = "unknown" if latest is None else f"{latest} MB"
         text = (
             f"{summary['count']} sample(s) over {hours}h: free VRAM is "
             f"{summary['direction']} (min {summary['min_free_mb']} MB, "
-            f"max {summary['max_free_mb']} MB, now "
-            f"{summary['latest_free_mb']} MB); "
+            f"max {summary['max_free_mb']} MB, now {now_text}); "
             f"{summary['thrashing_samples']} sample(s) showed VRAM spilling "
             "to system RAM."
         )
-    return {**summary, "hours": hours, "samples": rows, "summary": text}
+    # The summary above already covers EVERY row; only the raw rows are capped,
+    # and the caller is told so rather than silently handed a subset.
+    truncated = len(rows) > _TREND_SAMPLE_CAP
+    if truncated:
+        text += (
+            f" Showing the {_TREND_SAMPLE_CAP} most recent raw samples of "
+            f"{len(rows)} (the figures above cover all of them)."
+        )
+    return {**summary, "hours": hours, "samples": rows[-_TREND_SAMPLE_CAP:],
+            "samples_truncated": truncated, "summary": text}
 
 
 @mcp.tool()
@@ -549,7 +585,13 @@ async def trend(hours: float = 1.0) -> dict:
 
     Answers "was this a gradual erosion or a sudden spike?" — the question a
     point-in-time ``vram_status()`` cannot. Returns direction, min/max/latest
-    free MB, how many samples showed driver spill, and the raw samples.
+    free MB (``latest`` is ``null`` when the newest sample carries no reading),
+    how many samples showed driver spill, and the raw samples.
+
+    ``samples`` holds at most the 200 most recent rows so a long window can't
+    flood the caller's context; ``samples_truncated`` says whether older rows
+    were dropped. Every summary figure is computed over the FULL window either
+    way.
     """
     return await _in_thread(_trend_impl, hours)
 

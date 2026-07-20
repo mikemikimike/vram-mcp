@@ -200,6 +200,115 @@ def test_pressure_thrashing_beats_degraded():
     assert p["non_local_mb"] == 4096
 
 
+# The live shape this machine runs: a 32B model deliberately part-offloaded on
+# a 24 GB card. On Windows/WDDM the runner's CPU-side layers are reported as
+# that PROCESS's "Non Local Usage", so its non-local MB is explained memory,
+# not driver paging.
+RUNNER_PID = 41508
+QWEN_TOTAL_MB = 27802
+QWEN_VRAM_MB = 22281
+QWEN_OFFLOAD_MB = QWEN_TOTAL_MB - QWEN_VRAM_MB   # 5521
+
+
+def _offloaded_model(name="qwen3:32b"):
+    return {"name": name, "total_size_mb": QWEN_TOTAL_MB,
+            "size_vram_mb": QWEN_VRAM_MB, "offloaded_to_cpu": True}
+
+
+def test_pressure_runner_non_local_within_its_offload_is_not_paging():
+    """The steady state of a 32B on a 24 GB card: the runner's non-local MB is
+    the deliberate CPU offload seen from the driver's side. Calling that
+    'the driver is paging' is a false statement of fact."""
+    procs = [{"pid": RUNNER_PID, "size_mb": 22371, "non_local_mb": 3906}]
+    p = core.pressure(GPUS_TIGHT, [_offloaded_model()], procs,
+                      runner_offloads={RUNNER_PID: QWEN_OFFLOAD_MB})
+    assert p["state"] == "degraded"
+    assert p["spilling"] is False
+    assert p["explained_offload_mb"] == 3906
+    assert p["unexplained_spill_mb"] == 0
+    assert p["non_local_mb"] == 3906          # the total is still reported
+    assert "not paging" in p["detail"]
+
+
+def test_pressure_runner_non_local_beyond_its_offload_is_real_spill():
+    """'My model is being paged because something else ballooned' — the case
+    neither the filtered nor the unfiltered table ever caught."""
+    procs = [{"pid": RUNNER_PID, "size_mb": 22371, "non_local_mb": 9000}]
+    p = core.pressure(GPUS_OK, [_offloaded_model()], procs,
+                      runner_offloads={RUNNER_PID: QWEN_OFFLOAD_MB})
+    assert p["state"] == "thrashing"
+    assert p["spilling"] is True
+    assert p["explained_offload_mb"] == QWEN_OFFLOAD_MB
+    assert p["unexplained_spill_mb"] == 9000 - QWEN_OFFLOAD_MB
+
+
+def test_pressure_non_runner_non_local_is_real_spill():
+    """Nothing explains another process's non-local memory -> genuine paging,
+    even while a model is legitimately offloaded."""
+    procs = [{"pid": RUNNER_PID, "size_mb": 22371, "non_local_mb": 3906},
+             {"pid": 3220, "size_mb": 4000, "non_local_mb": 4096}]
+    p = core.pressure(GPUS_OK, [_offloaded_model()], procs,
+                      runner_offloads={RUNNER_PID: QWEN_OFFLOAD_MB})
+    assert p["state"] == "thrashing"
+    assert p["unexplained_spill_mb"] == 4096
+    assert p["explained_offload_mb"] == 3906
+    assert p["non_local_mb"] == 3906 + 4096
+    assert "4096 MB" in p["detail"]
+
+
+def test_pressure_sums_runner_excess_and_other_processes():
+    procs = [{"pid": RUNNER_PID, "size_mb": 22371, "non_local_mb": 9000},
+             {"pid": 3220, "size_mb": 4000, "non_local_mb": 4096}]
+    p = core.pressure(GPUS_OK, [_offloaded_model()], procs,
+                      runner_offloads={RUNNER_PID: QWEN_OFFLOAD_MB})
+    assert p["state"] == "thrashing"
+    assert p["unexplained_spill_mb"] == (9000 - QWEN_OFFLOAD_MB) + 4096
+    assert p["explained_offload_mb"] == QWEN_OFFLOAD_MB
+
+
+def test_pressure_unknown_runner_pids_attribute_nothing():
+    """Without a runner map (no snapshot) every row is 'other' — the honest
+    fallback: we cannot prove anything explains the non-local memory."""
+    procs = [{"pid": RUNNER_PID, "non_local_mb": 3906}]
+    p = core.pressure(GPUS_OK, [_offloaded_model()], procs)
+    assert p["unexplained_spill_mb"] == 3906
+    assert p["state"] == "thrashing"
+
+
+def test_runner_offloads_maps_pid_to_deliberate_offload():
+    loaded = [_offloaded_model(), {"name": "small", "total_size_mb": 4096,
+                                   "size_vram_mb": 4096}]
+    snap = _snap(pid_map={"qwen3:32b": RUNNER_PID, "small": 777})
+    assert core.runner_offloads(loaded, snap) == {RUNNER_PID: QWEN_OFFLOAD_MB,
+                                                  777: 0}
+
+
+def test_runner_offloads_skips_uncorrelated_models():
+    """A model whose runner PID could not be resolved entitles nobody."""
+    assert core.runner_offloads([_offloaded_model()], _snap(pid_map={})) == {}
+
+
+def test_combined_status_live_offload_shape_is_degraded_not_thrashing():
+    """End-to-end wiring of the shipped defect: full process table + resolved
+    runner PID + a deliberately offloaded model must read 'degraded'."""
+    models = [{"name": "qwen3:32b", "size": 29153380267,
+               "size_vram": 23363762257, "expires_at": None}]
+    status = core.combined_status(
+        lambda: [{"index": 0, "total_mb": 24576, "used_mb": 24017, "free_mb": 559}],
+        FakeOllama(models),
+        snapshot_fn=lambda: _snap(pid_map={"qwen3:32b": RUNNER_PID}),
+        procinfo_fn=lambda: [
+            {"pid": RUNNER_PID, "size_mb": 22371, "non_local_mb": 3906},
+            {"pid": 9968, "size_mb": 671, "non_local_mb": 3},
+        ],
+    )
+    p = status["pressure"]
+    assert p["state"] == "degraded"
+    assert p["spilling"] is False
+    assert p["unexplained_spill_mb"] == 3
+    assert p["explained_offload_mb"] == 3906
+
+
 def test_pressure_ignores_noise_below_threshold():
     procs = [{"pid": 1, "non_local_mb": 10}, {"pid": 2, "non_local_mb": 20}]
     p = core.pressure(GPUS_OK, [], procs)
@@ -265,22 +374,31 @@ def test_combined_status_other_processes_from_procinfo():
 
 def test_pressure_sees_ollama_runner_spill():
     """The runner is filtered out of other_processes but MUST still count
-    toward spill: it is the biggest holder and the thing that actually spills."""
+    toward spill: it is the biggest holder and the thing that actually spills.
+
+    The model here is DELIBERATELY OFFLOADED (4 GB of a 20 GB model on the CPU)
+    and its runner holds 8 GB non-local — double what that placement explains.
+    An earlier version of this test used size == size_vram, the one shape where
+    'any runner non-local means thrashing' happens to be right, so it could not
+    see the offloaded case regressing."""
     calls = []
 
     def source():
         calls.append(1)
-        return [{"pid": 999, "size_mb": 20000, "non_local_mb": 4096},
+        return [{"pid": 999, "size_mb": 20000, "non_local_mb": 8192},
                 {"pid": 111, "size_mb": 100, "non_local_mb": 0}]
 
     status = core.combined_status(
         lambda: [{"index": 0, "total_mb": 24576, "used_mb": 24000, "free_mb": 576}],
-        FakeOllama([{"name": "m", "size": 1, "size_vram": 1}]),
+        FakeOllama([{"name": "m", "size": gb_bytes(20), "size_vram": gb_bytes(16)}]),
         snapshot_fn=lambda: _snap(pid_map={"m": 999}),
         procinfo_fn=source,
     )
-    assert status["pressure"]["non_local_mb"] == 4096
-    assert status["pressure"]["state"] == "thrashing"
+    p = status["pressure"]
+    assert p["non_local_mb"] == 8192
+    assert p["explained_offload_mb"] == 4096      # the deliberate placement
+    assert p["unexplained_spill_mb"] == 4096      # the excess: real paging
+    assert p["state"] == "thrashing"
     # the runner is still excluded from the "other processes" view
     assert [p["pid"] for p in status["other_processes"]] == [111]
     # and the expensive source was sampled exactly once

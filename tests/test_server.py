@@ -56,6 +56,21 @@ def test_run_detection_samples_when_gpu_data_present(audit_spy):
     assert audit_spy["sample"][0]["total_mb"] == 24576
 
 
+def test_run_detection_samples_the_unexplained_spill_not_the_raw_non_local(audit_spy):
+    """A deliberately CPU-offloaded model shows up as its runner's Non Local
+    Usage. Recording that as spill would make trend() report the GPU 'spilling
+    to system RAM' for the whole life of a normal 32B load."""
+    status = _status(gpus=[{"used_mb": 23768, "total_mb": 24576}])
+    status["pressure"] = {"free_mb": 559, "non_local_mb": 3950,
+                          "explained_offload_mb": 3906,
+                          "unexplained_spill_mb": 44, "state": "degraded"}
+    server._run_detection(status)
+    sample = audit_spy["sample"][0]
+    assert sample["spill_mb"] == 44
+    # the conflated figure must not be persisted under its old name
+    assert "non_local_mb" not in sample
+
+
 def test_full_status_forwards_the_spill_threshold(monkeypatch):
     """VRAM_MCP_SPILL_MB is only a knob if it actually reaches pressure()."""
     seen = {}

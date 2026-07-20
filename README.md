@@ -99,7 +99,7 @@ directly at the installed `vram-mcp` script.
   `"0"` to disable and skip the ~1 s Windows perf-counter cost on every
   `vram_status()`/`list_loaded()` call. It turns off **four** things, not one:
   disappearance/appearance detection, the process table, **driver-spill
-  detection** (`pressure.non_local_mb`/`spilling`/`thrashing` — only the
+  detection** (`pressure.unexplained_spill_mb`/`spilling`/`thrashing` — only the
   perf-counter table reports non-local VRAM, so `pressure` can still say
   `degraded`/`tight`/`ok` but never `thrashing`), and **trend sampling** (no
   samples are recorded, so `trend()` reports nothing over that period).
@@ -112,11 +112,22 @@ directly at the installed `vram-mcp` script.
   (shared across sessions). Defaults to `60`. The throttle matters: the event
   log is capped, so unthrottled samples would evict the action and
   disappearance events that carry the real diagnostic value.
-- `VRAM_MCP_SPILL_MB` — non-local VRAM (MB) at or above which `pressure`
-  reports `spilling`/`thrashing`. Defaults to `256`, below which non-local
-  usage is ordinary desktop noise (compositor, browser) rather than a model
-  paging to system RAM. Raise it if a background app keeps a steady spill you
-  don't care about; lower it to catch a spill earlier.
+- `VRAM_MCP_SPILL_MB` — *unexplained* non-local VRAM (MB) at or above which
+  `pressure` reports `spilling`/`thrashing`. Defaults to `256`, below which
+  non-local usage is ordinary desktop noise (compositor, browser) rather than a
+  model paging to system RAM. Raise it if a background app keeps a steady spill
+  you don't care about; lower it to catch a spill earlier.
+
+  "Unexplained" is load-bearing on Windows/WDDM: a llama.cpp runner's
+  *deliberately* CPU-offloaded layers are reported as that process's Non Local
+  Usage, so `pressure` attributes each process's non-local memory before
+  judging it. A runner is explained up to its own offload
+  (`total_size_mb - size_vram_mb`, reported as `explained_offload_mb`);
+  anything beyond that, plus every other process's non-local memory, is genuine
+  driver paging (`unexplained_spill_mb`). `non_local_mb` remains the raw total
+  of the two. A 32B model deliberately part-offloaded on a 24 GB card therefore
+  reads `degraded`, not `thrashing` — while that same runner being paged
+  because another app ballooned still reads `thrashing`.
 
 ## Multi-session coordination
 

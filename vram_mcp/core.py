@@ -129,29 +129,95 @@ def other_processes(process_table: list[dict], exclude_pids: set) -> list[dict]:
     return [p for p in process_table if p["pid"] not in exclude_pids]
 
 
-def pressure(gpus: list[dict], loaded: list[dict], other_processes: list[dict],
-             *, spill_threshold_mb: int = SPILL_THRESHOLD_MB,
+def runner_offloads(loaded: list[dict], snap: Snapshot) -> dict[int, int]:
+    """Runner PID → the MB that model DELIBERATELY placed on the CPU backend.
+
+    This is what lets :func:`pressure` tell explained non-local memory from
+    genuine paging. ``total_size_mb - size_vram_mb`` is Ollama's own account of
+    the split, and ``snap.pid_for`` names the OS process the driver will report
+    that memory against.
+
+    A model whose runner PID could not be correlated entitles nobody: attributing
+    its offload to an unknown PID would excuse some other process's spill.
+    ``max`` rather than a sum where two tags resolve to one PID — they are
+    aliases of ONE physical model (``ollama cp``, hf.co variants), so their
+    offloads are the same memory counted twice, and summing would excuse double.
+    """
+    out: dict[int, int] = {}
+    for m in loaded:
+        if not isinstance(m, dict):
+            continue
+        pid = snap.pid_for(m.get("name"))
+        if pid is None:
+            continue
+        offload = (m.get("total_size_mb") or 0) - (m.get("size_vram_mb") or 0)
+        out[pid] = max(out.get(pid, 0), max(0, offload))
+    return out
+
+
+def pressure(gpus: list[dict], loaded: list[dict], process_table: list[dict],
+             *, runner_offloads: Optional[dict] = None,
+             spill_threshold_mb: int = SPILL_THRESHOLD_MB,
              tight_mb: int = TIGHT_MB) -> dict:
     """Classify how close the GPU is to a slow-mode, and which one.
 
-    Two independent degradations exist and must not be conflated:
+    Two degradations exist and must not be conflated:
 
     * **Driver-forced spill** — WDDM demand-pages VRAM to system RAM under
-      pressure (``non_local_mb``). This is the severe multi-x slowdown.
+      pressure. This is the severe multi-x slowdown.
     * **Deliberate CPU offload** — Ollama chose to put layers on the CPU
       backend up front (``offloaded_to_cpu``). Slower, but a considered
       placement, not paging.
 
-    Returns ``{"state", "free_mb", "non_local_mb", "spilling",
-    "offloaded_models", "detail"}``. ``state`` is the first match of
+    They are NOT two independent readings, which is the trap this function was
+    originally built on. On Windows/WDDM a llama.cpp runner's deliberately
+    CPU-side layers ARE reported as that process's ``Non Local Usage``: the same
+    physical memory described twice. Believing the counter alone makes every
+    32B-on-a-24GB-card — the normal reason to offload at all — announce "the
+    driver is paging" on a perfectly quiet GPU.
+
+    So non-local memory is ATTRIBUTED rather than summed. A row is explained
+    only up to what something accounts for:
+
+    * a runner PID in ``runner_offloads`` (pid → deliberate offload MB, from
+      :func:`runner_offloads`) is explained up to that figure;
+    * a runner's non-local memory BEYOND its offload is not — that is precisely
+      "my model is being paged because another app ballooned";
+    * any other process's non-local memory is not explained at all.
+
+    Without ``runner_offloads`` (no coordination snapshot) nothing can be
+    attributed and every row counts as unexplained — the honest fallback, since
+    we cannot prove the memory is deliberate.
+
+    ``process_table`` is the FULL table including runners; the runner-filtered
+    view is a different question (see :func:`other_processes`).
+
+    Returns ``{"state", "free_mb", "non_local_mb", "explained_offload_mb",
+    "unexplained_spill_mb", "spilling", "offloaded_models", "detail"}``.
+    ``non_local_mb`` is the raw total of the two halves and is reported for
+    transparency only — ``spilling``, ``state`` and ``detail`` all key off
+    ``unexplained_spill_mb``. ``state`` is the first match of
     thrashing > degraded > tight > ok.
     """
     free_mb = _gpu.max_free_mb(gpus)
-    non_local_mb = sum(
-        p.get("non_local_mb") or 0
-        for p in other_processes if isinstance(p, dict)
-    )
-    spilling = non_local_mb >= spill_threshold_mb
+    entitlements = runner_offloads or {}
+    explained_mb = 0
+    unexplained_mb = 0
+    for p in process_table:
+        if not isinstance(p, dict):
+            continue
+        non_local = p.get("non_local_mb") or 0
+        if non_local <= 0:
+            continue
+        entitled = entitlements.get(p.get("pid"))
+        if entitled is None:      # not a runner -> nothing accounts for it
+            unexplained_mb += non_local
+            continue
+        covered = min(non_local, max(entitled, 0))
+        explained_mb += covered
+        unexplained_mb += non_local - covered
+    non_local_mb = explained_mb + unexplained_mb
+    spilling = unexplained_mb >= spill_threshold_mb
     offloaded = [
         m["name"] for m in loaded
         if isinstance(m, dict) and m.get("offloaded_to_cpu") and m.get("name")
@@ -160,9 +226,15 @@ def pressure(gpus: list[dict], loaded: list[dict], other_processes: list[dict],
     if spilling:
         state = "thrashing"
         detail = (
-            f"{non_local_mb} MB of VRAM has spilled to system RAM; the driver "
+            f"{unexplained_mb} MB of VRAM has spilled to system RAM; the driver "
             "is paging. Expect severe slowdown — free VRAM or reduce load."
         )
+        # Say so, or the reader assumes the whole non-local figure is paging.
+        if explained_mb:
+            detail += (
+                f" (A further {explained_mb} MB of non-local memory is Ollama's "
+                "deliberate CPU offload, not paging.)"
+            )
     elif offloaded:
         state = "degraded"
         detail = (
@@ -182,6 +254,8 @@ def pressure(gpus: list[dict], loaded: list[dict], other_processes: list[dict],
         "state": state,
         "free_mb": free_mb,
         "non_local_mb": non_local_mb,
+        "explained_offload_mb": explained_mb,
+        "unexplained_spill_mb": unexplained_mb,
         "spilling": spilling,
         "offloaded_models": offloaded,
         "detail": detail,
@@ -216,9 +290,14 @@ def combined_status(
     gpus = gpu_status_fn()
     loaded = _loaded_models(ollama)
     resolved_pids: set = set()
+    offloads: dict = {}
     # Nothing loaded -> nothing to enrich; skip the snapshot's subprocess/IO.
     if snapshot_fn is not None and loaded:
-        loaded, resolved_pids = attach_coordination(loaded, snapshot_fn())
+        snap = snapshot_fn()
+        loaded, resolved_pids = attach_coordination(loaded, snap)
+        # The SAME snapshot answers both questions, so the pid map is walked
+        # once: which PIDs are runners, and how much offload each explains.
+        offloads = runner_offloads(loaded, snap)
     result = {
         "gpus": gpus,
         "loaded": loaded,
@@ -227,9 +306,11 @@ def combined_status(
     source = procinfo_fn if procinfo_fn is not None else nvml_processes_fn
     # The source is sampled EXACTLY ONCE (a ~1 s Windows perf-counter call) and
     # the same rows feed both consumers, which need DIFFERENT views:
-    #   * pressure  -> the FULL table. The Ollama runner is normally the biggest
-    #     VRAM holder and the process that actually spills to system RAM, so
-    #     hiding it would blind spill detection precisely when it matters.
+    #   * pressure  -> the FULL table plus the offload entitlements. The Ollama
+    #     runner is normally the biggest VRAM holder and CAN genuinely be paged,
+    #     so hiding it blinds spill detection; but its non-local memory is
+    #     mostly its own deliberate offload, so counting it raw invents a spill.
+    #     Only the full table + entitlements can tell those apart.
     #   * other_processes -> the runner-filtered view, since those PIDs are
     #     already reported as model entries.
     full_table: list[dict] = []
@@ -237,6 +318,7 @@ def combined_status(
         full_table = source()
         result["other_processes"] = other_processes(full_table, resolved_pids)
     result["pressure"] = pressure(gpus, loaded, full_table,
+                                  runner_offloads=offloads,
                                   spill_threshold_mb=spill_threshold_mb)
     return result
 

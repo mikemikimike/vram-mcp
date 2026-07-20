@@ -90,7 +90,11 @@ def _run_detection(status: dict) -> None:
                 "free_mb": p.get("free_mb"),
                 "used_mb": sum(g.get("used_mb") or 0 for g in gpus),
                 "total_mb": sum(g.get("total_mb") or 0 for g in gpus),
-                "non_local_mb": p.get("non_local_mb"),
+                # The UNEXPLAINED half only. A model's deliberate CPU offload is
+                # reported as its runner's non-local memory too, and persisting
+                # that as spill would make every normal big-model session read
+                # back as hours of driver paging.
+                "spill_mb": p.get("unexplained_spill_mb"),
                 "state": p.get("state"),
                 "loaded_count": len(status.get("loaded", [])),
             },
@@ -174,9 +178,10 @@ async def vram_status() -> dict:
     Returns per-GPU totals, the list of resident models (each with claim
     attribution, a best-effort busy signal, and CPU-offload detection), every
     other VRAM-holding process on the GPU, the best free VRAM, a ``pressure``
-    dict (state ok|tight|degraded|thrashing, separating driver-forced spill to
-    system RAM from Ollama's deliberate CPU offload), and a human-readable
-    ``summary``.
+    dict (state ok|tight|degraded|thrashing, reporting driver-forced spill to
+    system RAM — ``unexplained_spill_mb`` — separately from Ollama's deliberate
+    CPU offload — ``explained_offload_mb`` — which Windows reports as the same
+    non-local memory), and a human-readable ``summary``.
     """
     return await _in_thread(_vram_status_impl)
 

@@ -362,6 +362,19 @@ def test_reserve_round_trip(tmp_path):
     assert rec["model"] is None
 
 
+@pytest.mark.parametrize("gb", [0, -8.0, "eight", None])
+def test_reserve_rejects_non_positive_gb(tmp_path, gb):
+    """A negative reservation would subtract from another session's total, so
+    one session could silently cancel another's. Reject it at the boundary and
+    never let the record reach the shared ledger."""
+    path = tmp_path / "claims.json"
+    now = datetime(2026, 7, 19, 12, 0, 0, tzinfo=timezone.utc)
+    with pytest.raises(ValueError):
+        claims.reserve(gb, "sneaky", "cancel yours", 3600,
+                       path=path, now_fn=lambda: now)
+    assert claims.list_claims(path=path, now_fn=lambda: now) == []
+
+
 def test_reservation_expires_by_ttl(tmp_path):
     path = tmp_path / "claims.json"
     now = datetime(2026, 7, 19, 12, 0, 0, tzinfo=timezone.utc)

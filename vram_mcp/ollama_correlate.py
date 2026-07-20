@@ -21,6 +21,11 @@ This is inherently undocumented and version-dependent. Every function
 degrades to ``None``/``{}`` on any parse/lookup failure rather than guessing,
 so a future Ollama layout change only turns a model's ``busy`` signal into
 "unknown," never breaks anything else.
+
+Because the correlation lives or dies on getting Ollama's TAG NAMING right,
+this module also owns those naming rules as pure helpers — manifest path → tag
+name (:func:`_tag_name_from_manifest_parts`) and bare name → ``:latest``
+(:func:`resolve_tag`) — so no caller has to re-derive them inline.
 """
 
 from __future__ import annotations
@@ -149,6 +154,31 @@ def _tag_name_from_manifest_parts(registry_host: str, namespace: str,
             return f"{name}:{tag}"
         return f"{namespace}/{name}:{tag}"
     return f"{registry_host}/{namespace}/{name}:{tag}"
+
+
+def resolve_tag(model: str, known) -> Optional[str]:
+    """The key in ``known`` that Ollama would resolve ``model`` to, or ``None``.
+
+    Ollama's naming rule: a tag-less name means the ``:latest`` tag, so
+    ``ollama run llama3.2`` and ``llama3.2:latest`` are the same model. Anything
+    keyed by the names Ollama reports (``/api/tags``, ``/api/ps``) therefore
+    misses on a bare name — verified live: ``tags()['qwen3:32b']`` exists while
+    ``tags().get('qwen3')`` is ``None``. That miss reads as "size unknown",
+    which is how a bare name slipped past ``warm()``'s headroom refusal.
+
+    A name that ALREADY carries a tag never falls back to ``:latest``:
+    ``qwen3:32b`` and ``qwen3:latest`` are different models of different sizes,
+    and a wrong size is worse than an unknown one.
+    """
+    if not model:
+        return None
+    if model in known:
+        return model
+    if ":" not in model:
+        latest = f"{model}:latest"
+        if latest in known:
+            return latest
+    return None
 
 
 def _digest_to_tags(manifests_root: Path) -> dict[str, set[str]]:

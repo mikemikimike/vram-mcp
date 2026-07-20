@@ -97,14 +97,24 @@ def reserve(
     or protect a model. ``pid`` is advisory: it records which process the
     reservation is for.
 
-    Returns ``{"claim_id", "expires_at"}``.
+    Returns ``{"claim_id", "expires_at"}``. Raises ``ValueError`` for a
+    non-numeric or non-positive ``gb``: totals are summed across sessions, so a
+    negative reservation would SUBTRACT — one session could silently cancel
+    another's. Rejected at this boundary, before anything reaches the shared
+    ledger file, since a bad record there outlives the call that wrote it.
     """
     path = path or _DEFAULT_PATH
+    try:
+        gb = float(gb)
+    except (TypeError, ValueError):
+        raise ValueError(f"gb must be a positive number of gigabytes, got {gb!r}")
+    if not gb > 0:      # also rejects NaN, which no comparison would catch
+        raise ValueError(f"gb must be greater than 0, got {gb!r}")
     now = now_fn()
     expires_at = now + timedelta(seconds=ttl_seconds)
     record = {
         "claim_id": uuid.uuid4().hex, "kind": "reservation",
-        "model": None, "gb": float(gb), "pid": pid,
+        "model": None, "gb": gb, "pid": pid,
         "owner": owner, "purpose": purpose,
         "claimed_at": _iso(now), "renewed_at": _iso(now),
         "ttl_seconds": ttl_seconds, "expires_at": _iso(expires_at),

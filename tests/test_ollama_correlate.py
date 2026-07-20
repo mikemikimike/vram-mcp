@@ -381,3 +381,33 @@ def test_windows_wmic_other_failure_returns_empty_without_fallback(monkeypatch):
     monkeypatch.setattr(oc.subprocess, "run", fake_run)
     assert oc._list_llama_server_processes_windows() == []
     assert calls == ["wmic"]
+
+
+# ---- resolve_tag: Ollama's bare-name -> ":latest" rule ----------------------
+
+def test_resolve_tag_exact_match_wins():
+    known = {"qwen3:32b": 19265, "llama3.2:latest": 1900}
+    assert oc.resolve_tag("qwen3:32b", known) == "qwen3:32b"
+
+
+def test_resolve_tag_bare_name_resolves_to_latest():
+    # Ollama itself resolves a bare name to its ":latest" tag, so a caller
+    # asking for "llama3.2" gets a real multi-GB model — its size must be
+    # findable, or the admission check silently degrades to "size unknown".
+    known = {"llama3.2:latest": 1900}
+    assert oc.resolve_tag("llama3.2", known) == "llama3.2:latest"
+
+
+def test_resolve_tag_unknown_name_is_none():
+    known = {"llama3.2:latest": 1900}
+    assert oc.resolve_tag("nope", known) is None
+    assert oc.resolve_tag("nope:7b", known) is None
+    assert oc.resolve_tag("", known) is None
+    assert oc.resolve_tag(None, known) is None
+
+
+def test_resolve_tag_tagged_name_never_falls_back_to_latest():
+    # "qwen3:32b" must NOT be answered with "qwen3:latest" — a different model
+    # of a different size; a wrong size is worse than an unknown one.
+    known = {"qwen3:latest": 5000}
+    assert oc.resolve_tag("qwen3:32b", known) is None

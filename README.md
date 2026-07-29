@@ -112,11 +112,19 @@ directly at the installed `vram-mcp` script.
   (shared across sessions). Defaults to `60`. The throttle matters: the event
   log is capped, so unthrottled samples would evict the action and
   disappearance events that carry the real diagnostic value.
-- `VRAM_MCP_SPILL_MB` — *unexplained* non-local VRAM (MB) at or above which
-  `pressure` reports `spilling`/`thrashing`. Defaults to `256`, below which
-  non-local usage is ordinary desktop noise (compositor, browser) rather than a
-  model paging to system RAM. Raise it if a background app keeps a steady spill
-  you don't care about; lower it to catch a spill earlier.
+- `VRAM_MCP_SPILL_MB` — the *floor* of unexplained non-local VRAM (MB) below
+  which `pressure` will not report `spilling`/`thrashing`. Defaults to `256`,
+  beneath which non-local usage is ordinary desktop noise (compositor, browser)
+  rather than a model paging to system RAM. Raise it if a background app keeps a
+  steady spill you don't care about; lower it to catch a spill earlier.
+
+  Clearing the floor is necessary but not sufficient: the spill must also
+  **exceed the free VRAM**. The driver evicts only when it runs out of room, so
+  non-local memory on a card with gigabytes free is routine allocation, not
+  paging — and "free VRAM or reduce load" would be advice about VRAM you already
+  have. Both gates must pass, so raising this value can only ever silence the
+  alarm, never trigger one. When free VRAM is unreadable (no `nvidia-smi`) the
+  card cannot be cleared of blame and the floor decides alone.
 
   "Unexplained" is load-bearing on Windows/WDDM: a llama.cpp runner's
   *deliberately* CPU-offloaded layers are reported as that process's Non Local

@@ -15,7 +15,7 @@ from ._util import bytes_to_mb as _shared_bytes_to_mb
 
 _MB_PER_GB = 1024
 
-SPILL_THRESHOLD_MB = 256   # below this, non-local usage is normal desktop noise
+SPILL_THRESHOLD_MB = 256   # floor only; pressure() also compares against free VRAM
 TIGHT_MB = 1024
 
 
@@ -192,12 +192,19 @@ def pressure(gpus: list[dict], loaded: list[dict], process_table: list[dict],
     ``process_table`` is the FULL table including runners; the runner-filtered
     view is a different question (see :func:`other_processes`).
 
+    Unexplained memory is then weighed rather than simply totalled. Size alone
+    never proved paging: the driver evicts only when it runs out of room, so a
+    spill is credible only when it EXCEEDS the free VRAM — had there been room,
+    the memory would still be resident. ``spill_threshold_mb`` is the floor
+    beneath which even that comparison is noise, not the whole test.
+
     Returns ``{"state", "free_mb", "non_local_mb", "explained_offload_mb",
     "unexplained_spill_mb", "spilling", "offloaded_models", "detail"}``.
     ``non_local_mb`` is the raw total of the two halves and is reported for
     transparency only — ``spilling``, ``state`` and ``detail`` all key off
-    ``unexplained_spill_mb``. ``state`` is the first match of
-    thrashing > degraded > tight > ok.
+    ``unexplained_spill_mb``, which is always reported even when it is too
+    small (or too well-covered by free VRAM) to raise the alarm. ``state`` is
+    the first match of thrashing > degraded > tight > ok.
     """
     free_mb = _gpu.max_free_mb(gpus)
     entitlements = runner_offloads or {}
@@ -217,7 +224,18 @@ def pressure(gpus: list[dict], loaded: list[dict], process_table: list[dict],
         explained_mb += covered
         unexplained_mb += non_local - covered
     non_local_mb = explained_mb + unexplained_mb
-    spilling = unexplained_mb >= spill_threshold_mb
+    # Two gates, because size alone was not evidence of paging. The driver only
+    # evicts when it runs out of room, so unexplained non-local memory is only
+    # credible as paging when it exceeds what the card still has FREE — if there
+    # were room for it, the driver would have kept it resident. Without that
+    # comparison, ~400 MB of routine allocation (staging buffers, shared
+    # surfaces) across ordinary desktop apps announced "expect severe slowdown"
+    # on a card with gigabytes free, and told the reader to free VRAM they
+    # already had. An unreadable free figure (no nvidia-smi) cannot clear the
+    # card of blame, so the floor alone decides there.
+    spilling = unexplained_mb >= spill_threshold_mb and (
+        free_mb is None or unexplained_mb > free_mb
+    )
     offloaded = [
         m["name"] for m in loaded
         if isinstance(m, dict) and m.get("offloaded_to_cpu") and m.get("name")

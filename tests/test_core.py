@@ -232,9 +232,12 @@ def test_pressure_runner_non_local_within_its_offload_is_not_paging():
 
 def test_pressure_runner_non_local_beyond_its_offload_is_real_spill():
     """'My model is being paged because something else ballooned' — the case
-    neither the filtered nor the unfiltered table ever caught."""
+    neither the filtered nor the unfiltered table ever caught.
+
+    The GPU must be CONSTRAINED for this to be paging at all: spill is only
+    credible when the card lacked the room to keep it resident."""
     procs = [{"pid": RUNNER_PID, "size_mb": 22371, "non_local_mb": 9000}]
-    p = core.pressure(GPUS_OK, [_offloaded_model()], procs,
+    p = core.pressure(GPUS_TIGHT, [_offloaded_model()], procs,
                       runner_offloads={RUNNER_PID: QWEN_OFFLOAD_MB})
     assert p["state"] == "thrashing"
     assert p["spilling"] is True
@@ -247,7 +250,7 @@ def test_pressure_non_runner_non_local_is_real_spill():
     even while a model is legitimately offloaded."""
     procs = [{"pid": RUNNER_PID, "size_mb": 22371, "non_local_mb": 3906},
              {"pid": 3220, "size_mb": 4000, "non_local_mb": 4096}]
-    p = core.pressure(GPUS_OK, [_offloaded_model()], procs,
+    p = core.pressure(GPUS_TIGHT, [_offloaded_model()], procs,
                       runner_offloads={RUNNER_PID: QWEN_OFFLOAD_MB})
     assert p["state"] == "thrashing"
     assert p["unexplained_spill_mb"] == 4096
@@ -259,7 +262,7 @@ def test_pressure_non_runner_non_local_is_real_spill():
 def test_pressure_sums_runner_excess_and_other_processes():
     procs = [{"pid": RUNNER_PID, "size_mb": 22371, "non_local_mb": 9000},
              {"pid": 3220, "size_mb": 4000, "non_local_mb": 4096}]
-    p = core.pressure(GPUS_OK, [_offloaded_model()], procs,
+    p = core.pressure(GPUS_TIGHT, [_offloaded_model()], procs,
                       runner_offloads={RUNNER_PID: QWEN_OFFLOAD_MB})
     assert p["state"] == "thrashing"
     assert p["unexplained_spill_mb"] == (9000 - QWEN_OFFLOAD_MB) + 4096
@@ -270,8 +273,57 @@ def test_pressure_unknown_runner_pids_attribute_nothing():
     """Without a runner map (no snapshot) every row is 'other' — the honest
     fallback: we cannot prove anything explains the non-local memory."""
     procs = [{"pid": RUNNER_PID, "non_local_mb": 3906}]
-    p = core.pressure(GPUS_OK, [_offloaded_model()], procs)
+    p = core.pressure(GPUS_TIGHT, [_offloaded_model()], procs)
     assert p["unexplained_spill_mb"] == 3906
+    assert p["state"] == "thrashing"
+
+
+# The driver only evicts when it runs out of room. Non-local memory while the
+# card has plenty free is routine allocation (staging buffers, shared surfaces),
+# not paging — and "free VRAM or reduce load" is nonsense advice with 2.6 GB free.
+GPUS_ROOMY = [{"index": 0, "total_mb": 24576, "used_mb": 21894, "free_mb": 2682}]
+
+
+def test_pressure_spill_below_free_vram_is_not_paging():
+    """The live false alarm: 386 MB non-local spread across ordinary desktop
+    apps while 2682 MB is free read as 'the driver is paging'. It cannot be —
+    with that much free the driver had no reason to evict anything."""
+    procs = [{"pid": 32220, "non_local_mb": 244},   # UnrealEditor
+             {"pid": 19808, "non_local_mb": 82},    # a CUDA python job
+             {"pid": 26344, "non_local_mb": 30},
+             {"pid": 27004, "non_local_mb": 12},
+             {"pid": 29572, "non_local_mb": 10},
+             {"pid": 1500, "non_local_mb": 8}]
+    p = core.pressure(GPUS_ROOMY, [], procs)
+    assert p["unexplained_spill_mb"] == 386   # still reported, just not alarming
+    assert p["spilling"] is False
+    assert p["state"] == "ok"
+
+
+def test_pressure_spill_exceeding_free_vram_is_paging():
+    """More has been pushed to system RAM than the card has free — the driver
+    would have kept it resident if there were room."""
+    p = core.pressure(GPUS_TIGHT, [], [{"pid": 1, "non_local_mb": 3949}])
+    assert p["spilling"] is True
+    assert p["state"] == "thrashing"
+
+
+def test_pressure_spill_gate_needs_both_the_floor_and_the_free_comparison():
+    """A spill larger than free VRAM but below the absolute floor is still
+    noise: 200 MB of non-local memory is not a multi-x slowdown."""
+    p = core.pressure([{"index": 0, "free_mb": 100}], [],
+                      [{"pid": 1, "non_local_mb": 200}])
+    assert p["unexplained_spill_mb"] == 200
+    assert p["spilling"] is False
+
+
+def test_pressure_spill_alarms_when_free_vram_is_unreadable():
+    """No nvidia-smi -> no free figure to compare against. We cannot prove the
+    card had room, so a large unexplained spill still warrants the warning."""
+    p = core.pressure([{"index": 0, "free_mb": None}], [],
+                      [{"pid": 1, "non_local_mb": 4096}])
+    assert p["free_mb"] is None
+    assert p["spilling"] is True
     assert p["state"] == "thrashing"
 
 
@@ -407,15 +459,18 @@ def test_pressure_sees_ollama_runner_spill():
 
 def test_combined_status_forwards_spill_threshold():
     """A caller-supplied spill threshold must reach pressure(); the same
-    non-local MB is a verdict either way depending on the knob."""
+    non-local MB is a verdict either way depending on the knob.
+
+    Constrained GPU: the threshold is only the floor half of the gate, so the
+    free-VRAM comparison has to pass before the knob decides anything."""
     procs = [{"pid": 7, "size_mb": 900, "non_local_mb": 300}]
     loud = core.combined_status(
-        lambda: GPUS_OK, FakeOllama([]), procinfo_fn=lambda: list(procs),
+        lambda: GPUS_TIGHT, FakeOllama([]), procinfo_fn=lambda: list(procs),
         spill_threshold_mb=4096,
     )
     assert loud["pressure"]["spilling"] is False
     quiet = core.combined_status(
-        lambda: GPUS_OK, FakeOllama([]), procinfo_fn=lambda: list(procs),
+        lambda: GPUS_TIGHT, FakeOllama([]), procinfo_fn=lambda: list(procs),
         spill_threshold_mb=128,
     )
     assert quiet["pressure"]["spilling"] is True

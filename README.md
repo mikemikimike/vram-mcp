@@ -1,81 +1,56 @@
 # vram-mcp
 
-An [MCP](https://modelcontextprotocol.io) server that lets AI agents **share
-one NVIDIA GPU** safely. Built for the reality of several Claude Code / agent
-sessions juggling [Ollama](https://ollama.com) models on a single card: before
-loading the next model, an agent can see exactly what's holding VRAM, who's
-using it and why, whether it's computing *right now* — and free space without
-stepping on another session's in-flight work.
+Give your AI agents a shared view of GPU memory. Through
+[MCP](https://modelcontextprotocol.io), they can inspect what's using VRAM,
+make room for [Ollama](https://ollama.com) models, and see which sessions are
+already relying on them.
 
-- **Claims** — sessions declare *who* is using a model and *why*, in a shared
-  crash-safe ledger. TTL-based: a killed session never leaves a stuck claim.
-- **Real busy detection** — windowed per-process GPU utilization via NVML,
-  with zero changes to how anything calls Ollama.
-- **Protected eviction** — `unload`/`ensure_free` refuse to evict a claimed or
-  actively-computing model by default; `force=True` when you've decided.
-- **Full visibility** — every VRAM-holding process on the GPU, not just Ollama
-  models, plus CPU-offload detection (`size_vram < size` = spilled to RAM).
-- **Pressure detection** — distinguishes driver-forced VRAM spill to system RAM
-  (the severe slow-mode) from Ollama's deliberate CPU offload.
-- **Degrades gracefully** — no `nvidia-smi`/NVML/`wmic`? Readings become
-  `unknown`/`null`, never wrong; model list / unload / warm keep working.
-- NVIDIA + Ollama for now (see [Roadmap](#roadmap)).
+Each client runs its own server; sessions under the same OS user share claims,
+reservations, and an audit log. Claimed or recently busy models are protected
+from eviction by default.
 
-## Tools
+## Get started
 
-| Tool | Behavior |
-| --- | --- |
-| `vram_status()` | Per-GPU VRAM (total/used/free) + loaded Ollama models (with claims, busy signal, CPU-offload) + every other VRAM-holding process + best free MB + a `pressure` verdict (`ok`/`tight`/`degraded`/`thrashing`). |
-| `list_loaded()` | The models currently resident in VRAM (name, VRAM MB, expiry, claims, busy). |
-| `unload(model, force=False, by="unknown")` | Evict one model from VRAM now (`keep_alive=0`). Refuses if claimed/busy unless `force=True`. `by` records the requester in the audit log. |
-| `ensure_free(gb, force=False, by="unknown")` | Unload models largest-first until at least `gb` GB is free, skipping claimed/busy models unless `force=True`. `by` records the requester in the audit log. |
-| `warm(model, keep_alive="5m", by="unknown", force=False)` | Load/pin a model into VRAM for a duration. Refuses if active reservations leave no headroom for the model, unless `force=True`. `by` records the requester in the audit log. |
-| `advise()` | Heuristic suggestions (e.g. `OLLAMA_MAX_LOADED_MODELS=1`, finite `OLLAMA_KEEP_ALIVE`). |
-| `claim(model, owner, purpose, ttl_seconds=3600)` | Declare you're using a model, so others see who/why before evicting it. |
-| `reserve(gb, owner, purpose, ttl_seconds=3600, pid=None)` | Reserve GB of VRAM for non-Ollama work (a training run, a diffusion job) so other sessions see it's spoken for. |
-| `renew(claim_id, ttl_seconds=None)` | Extend a claim before it expires. |
-| `release(claim_id)` | Release a claim early. |
-| `list_claims(model=None)` | See active claims (all models, or one). |
-| `history(model=None, type=None, limit=50, since=None)` | The audit trail, newest first: who ran `unload`/`ensure_free`/`warm`, and which models/processes appeared or disappeared (with a best-effort cause). |
-| `trend(hours=1.0)` | Free-VRAM trend from the sampled audit log: direction, min/max/latest free MB, and how many samples showed driver spill. |
+Use **Python 3.10+**, a running **Ollama** instance, and an **NVIDIA GPU with
+drivers** for memory readings. Windows and Linux are tested. Without
+`nvidia-smi` or NVML, model operations and claims still work, but some readings
+are unavailable.
 
-## Requirements
+Run vram-mcp on the machine hosting Ollama and the GPU. Changing
+`OLLAMA_BASE_URL` redirects model requests; GPU and process inspection always
+remain local.
 
-- **Ollama** running locally (or reachable via `OLLAMA_BASE_URL`).
-- **NVIDIA GPU + drivers** for VRAM numbers. `nvidia-smi` is *optional* — without
-  it, VRAM is reported as `unknown` and model operations still function.
-- Python **3.10+**.
+### Connect your client
 
-## Install
+With [uv](https://docs.astral.sh/uv/getting-started/installation/) and Git
+installed, choose your client below. `uvx` fetches vram-mcp from GitHub into an
+isolated environment; no source checkout is needed.
 
-Run directly from GitHub with [uv](https://docs.astral.sh/uv/) (no install needed;
-the package is not on PyPI):
+**[Claude Code](https://code.claude.com/docs/en/mcp):**
 
-```bash
-uvx --from git+https://github.com/sushiHex/vram-mcp vram-mcp
+```sh
+claude mcp add vram --scope user -- uvx --from git+https://github.com/sushiHex/vram-mcp vram-mcp
 ```
 
-Or install from source for development:
+**[Codex](https://learn.chatgpt.com/docs/extend/mcp?surface=cli):**
 
-```bash
-git clone https://github.com/sushiHex/vram-mcp
-cd vram-mcp
-pip install -e .
+```sh
+codex mcp add vram -- uvx --from git+https://github.com/sushiHex/vram-mcp vram-mcp
 ```
 
-## Run
+**[Hermes](https://hermes-agent.nousresearch.com/docs/user-guide/features/mcp)** — merge into `~/.hermes/config.yaml`:
 
-```bash
-vram-mcp
+```yaml
+mcp_servers:
+  vram:
+    command: uvx
+    args: ["--from", "git+https://github.com/sushiHex/vram-mcp", "vram-mcp"]
 ```
 
-The server speaks MCP over stdio, so it is normally launched by an MCP client
-rather than by hand.
+<details>
+<summary>Claude Desktop and other clients using mcpServers JSON</summary>
 
-## MCP client config
-
-Add this to your MCP client's `mcpServers` config (e.g. Claude Code / Claude
-Desktop):
+Merge this entry into your client's MCP configuration:
 
 ```json
 {
@@ -88,148 +63,131 @@ Desktop):
 }
 ```
 
-Or, with a source checkout installed via `pip install -e .`, point `command`
-directly at the installed `vram-mcp` script.
+If the client cannot find `uvx`, use its absolute executable path. In JSON,
+Windows paths need escaped backslashes, such as `C:\\tools\\uvx.exe`.
 
-## Configuration
+</details>
 
-- `OLLAMA_BASE_URL` — Ollama endpoint. Defaults to `http://127.0.0.1:11434`.
-- `VRAM_MCP_AUDIT` — disappearance detection + the perf-counter-based process
-  table (`other_processes` size/name/cmdline on Windows). Defaults on; set to
-  `"0"` to disable and skip the ~1 s Windows perf-counter cost on every
-  `vram_status()`/`list_loaded()` call. It turns off **four** things, not one:
-  disappearance/appearance detection, the process table, **driver-spill
-  detection** (`pressure.unexplained_spill_mb`/`spilling`/`thrashing` — only the
-  perf-counter table reports non-local VRAM, so `pressure` can still say
-  `degraded`/`tight`/`ok` but never `thrashing`), and **trend sampling** (no
-  samples are recorded, so `trend()` reports nothing over that period).
-  Action events (`unload`/`ensure_free`/`warm`) are recorded either way.
-- `VRAM_MCP_MEANINGFUL_MB` — minimum dedicated VRAM (MB) for a non-Ollama
-  process to be tracked by disappearance detection. Defaults to `512`.
-- `VRAM_MCP_EVENT_CAP` — maximum events retained in `events.jsonl` (oldest
-  pruned first). Defaults to `5000`.
-- `VRAM_MCP_SAMPLE_SECONDS` — minimum seconds between free-VRAM trend samples
-  (shared across sessions). Defaults to `60`. The throttle matters: the event
-  log is capped, so unthrottled samples would evict the action and
-  disappearance events that carry the real diagnostic value.
-- `VRAM_MCP_SPILL_MB` — the *floor* of unexplained non-local VRAM (MB) below
-  which `pressure` will not report `spilling`/`thrashing`. Defaults to `256`,
-  beneath which non-local usage is ordinary desktop noise (compositor, browser)
-  rather than a model paging to system RAM. Raise it if a background app keeps a
-  steady spill you don't care about; lower it to catch a spill earlier.
+Reconnect your client after registration. It launches the server over stdio;
+running `vram-mcp` by hand waits for MCP input. Prefer a local installation?
+See [installing from source](docs/configuration.md#installing-from-source).
 
-  Clearing the floor is necessary but not sufficient: the spill must also
-  **exceed the free VRAM**. The driver evicts only when it runs out of room, so
-  non-local memory on a card with gigabytes free is routine allocation, not
-  paging — and "free VRAM or reduce load" would be advice about VRAM you already
-  have. Both gates must pass, so raising this value can only ever silence the
-  alarm, never trigger one. When free VRAM is unreadable (no `nvidia-smi`) the
-  card cannot be cleared of blame and the floor decides alone.
+### Make your first check
 
-  "Unexplained" is load-bearing on Windows/WDDM: a llama.cpp runner's
-  *deliberately* CPU-offloaded layers are reported as that process's Non Local
-  Usage, so `pressure` attributes each process's non-local memory before
-  judging it. A runner is explained up to its own offload
-  (`total_size_mb - size_vram_mb`, reported as `explained_offload_mb`);
-  anything beyond that, plus every other process's non-local memory, is genuine
-  driver paging (`unexplained_spill_mb`). `non_local_mb` remains the raw total
-  of the two. A 32B model deliberately part-offloaded on a 24 GB card therefore
-  reads `degraded`, not `thrashing` — while that same runner being paged
-  because another app ballooned still reads `thrashing`.
+Ask your agent:
 
-## Multi-session coordination
+> Check GPU memory with vram-mcp. Show what's loaded, who is using it, and how
+> much room is left. Report any unavailable readings.
 
-Since every session runs its own `vram-mcp` process, coordination happens via:
+The agent should call `vram_status()` and `list_claims()`. Status includes a
+readable `summary`, per-GPU readings, loaded models, and available process
+details. `list_claims()` also shows capacity reserved for training or other
+non-Ollama work.
 
-- **Claims** — a shared, file-based ledger (`~/.cache/vram-mcp/claims.json`) recording who's using a model and why. Call `claim()` when you start relying on a model; `renew()` periodically if still in use. An un-renewed claim simply expires — no cleanup needed if your session ends unexpectedly.
-- **Busy detection** — best-effort, via NVML's per-process GPU utilization (not point-in-time; reads a short recent window so brief gaps between tokens don't misread as idle). Requires no changes to how you call Ollama — it's entirely on vram-mcp's side.
-- **Protection** — `unload()`/`ensure_free()` refuse to evict a model that's claimed OR busy, by default. Pass `force=True` when you've already decided it's worth it.
+## Agent workflow
 
-Requires the `nvidia-ml-py` dependency (installed automatically). Falls back gracefully — `claims`/`busy` report as empty/`null` — on non-NVIDIA GPUs or if NVML is unavailable.
+These examples are **MCP tool calls** made inside a connected client, not shell
+commands or a Python API. Use a descriptive session label for `owner` and `by`,
+such as `codex:review`, so another agent can identify your work.
 
-### Reservations
+1. **Inspect before changing memory.** Call `vram_status()` and `list_claims()`.
+   Use exact model names, including tags, from Ollama; claim matching is exact.
+2. **Claim a model before relying on it.** Replace the example model below
+   with one already installed in Ollama. Continue only if the claim succeeds,
+   and save its returned `claim_id`.
 
-`reserve(gb, owner, purpose)` claims *capacity* rather than a named model, for
-the GPU work vram-mcp can't otherwise see — a training run, a diffusion job.
-Reservations share the claim ledger, so they inherit the same TTL and
-crash-safety semantics, and `ensure_free()` reports how much of the free VRAM
-they account for.
+   ```text
+   claim(model="llama3:latest", owner="codex:review", purpose="Review local code")
+   ```
 
-**Reservations are cooperative, not enforced.** They do two things: gate
-vram-mcp's own `warm()` (which refuses when a reservation leaves no headroom
-for the model, overridable with `force=True`) and tell other sessions the VRAM
-is spoken for. vram-mcp cannot intercept an Ollama auto-load triggered by a
-direct `/api/generate` call from another process — nothing outside vram-mcp is
-obliged to look at the ledger.
+3. **Make room when needed.** `ensure_free(gb=8, by="codex:review")` unloads
+   unprotected models largest-first. Choose the target for your workload and
+   check `ok`, `free_mb`, `declined`, and `reserved_mb`. Reaching the target
+   does not give you ownership of that space.
+4. **Load and check.** Call
+   `warm(model="llama3:latest", keep_alive="10m", by="codex:review")` when needed.
+   Inspect `ok` and `reason`, then check `vram_status()` again. Loading
+   successfully does not guarantee full GPU residency. Run inference through
+   your usual Ollama client.
+5. **Renew and release.** Claims expire after one hour by default. Call
+   `renew(claim_id="<returned claim_id>")` before expiry for longer work and
+   `release(claim_id="<returned claim_id>")` when finished, including if loading
+   fails. Releasing a claim does not unload the model; claim expiry and Ollama's
+   `keep_alive` are separate.
 
-### Audit trail
+For training or diffusion, use `reserve(gb=8, owner="codex:training",
+purpose="LoRA training")` to declare capacity, then renew/release its `claim_id`
+in the same way. A reservation records intent; it does not allocate memory.
 
-Every session shares one append-only, bounded log at
-`~/.cache/vram-mcp/events.jsonl` (paired with a `~/.cache/vram-mcp/last_seen.json`
-baseline). Three kinds of events land there:
+**Coordination is cooperative.** Direct Ollama calls can bypass it. `force=True`
+on `unload`, `ensure_free`, or `warm` overrides protection; use it only after
+resolving the competing work. `busy=null` means unknown and does not block
+eviction on its own. If `free_mb` is unknown, `ensure_free` can still unload
+models but cannot verify success. See [coordination details](docs/coordination.md).
 
-- **Actions** — every `unload`/`ensure_free`/`warm` call, tagged with the `by`
-  argument you passed (defaults to `"unknown"` if omitted), whether it
-  succeeded/failed/was refused, and why.
-- **Disappearances/appearances** — on every `vram_status()`/`list_loaded()`
-  call, vram-mcp diffs the current set of "meaningful" VRAM holders (every
-  Ollama model, plus any other process using at least `VRAM_MCP_MEANINGFUL_MB`
-  of dedicated VRAM) against the previous snapshot and logs what changed, with
-  a best-effort **cause**:
-  - `self_action` — a recent `unload`/`ensure_free` action from *this* log
-    explains the disappearance.
-  - `external` — no matching vram-mcp action; likely Ollama idle-expiry,
-    memory-pressure eviction, or an unload issued outside vram-mcp.
-  - `unattributed` — a non-Ollama process disappeared; vram-mcp can't observe
-    why a process exited.
-- **Samples** — a free-VRAM datapoint recorded on the same status calls, at
-  most once per `VRAM_MCP_SAMPLE_SECONDS` across all sessions. `trend(hours)`
-  reduces them to a direction, so you can tell a gradual erosion from a sudden
-  spike — the question a point-in-time `vram_status()` can't answer. Only calls
-  that actually read the GPU are sampled (`list_loaded()` skips the
-  `nvidia-smi` spawn, so it never records one), and `trend()` returns at most
-  the 200 most recent raw samples — flagged with `samples_truncated` — while
-  its min/max/latest/direction figures always cover the full window.
+## Understand the readings
 
-Call `history(model=None, type=None, limit=50, since=None)` to query it — e.g.
-"what happened to `llama3`?" or "did anything unexpectedly vanish in the last
-hour?". The whole audit path is best-effort: a failure to read or write the log
-never breaks a tool call. Disable detection (and its ~1 s Windows perf-counter
-cost) with `VRAM_MCP_AUDIT=0`; tune retention with `VRAM_MCP_EVENT_CAP` and the
-size threshold with `VRAM_MCP_MEANINGFUL_MB`. Action events
-(`unload`/`ensure_free`/`warm`) are always recorded regardless of
-`VRAM_MCP_AUDIT`. Everything *passive* is gated by it, though — setting it to
-`0` disables the disappearance/appearance detection, the perf-counter process
-table, **driver-spill detection** (`pressure` can no longer reach `thrashing`,
-since only that table reports non-local VRAM) and **trend sampling** (nothing
-is recorded, so `trend()` has nothing to report for that period).
+| `pressure.state` | Meaning |
+| --- | --- |
+| `ok` | No pressure detected in the available readings. |
+| `tight` | Less than 1 GiB is free on the GPU with the most room. |
+| `degraded` | Ollama placed part of a model on the CPU; expect slower inference. |
+| `thrashing` | Unexplained non-local memory meets the spill threshold and, when free VRAM is known, exceeds it. Driver paging is suspected. |
 
-`other_processes` (from `vram_status()`) now carries real `size_mb`/`name`/
-`cmdline` for every VRAM-holding process, not just Ollama's — on Windows via a
-`\GPU Process Memory(*)\Dedicated Usage` perf-counter sample joined with
-`Get-CimInstance Win32_Process` (the same source Task Manager uses), since
-NVML alone reports `null` sizes under WDDM. That perf-counter sample costs
-roughly 1 second per `vram_status()`/`list_loaded()` call; set
-`VRAM_MCP_AUDIT=0` to skip it (falls back to NVML's raw process list, sizes
-included where NVML can report them, names/cmdlines omitted).
+Missing telemetry limits these conclusions: `ok` with `free_mb=null` does not
+prove there is room for another model. Driver-spill detection needs Windows
+performance counters and auditing enabled. CPU offload is tracked separately.
+
+Use `history()` to investigate a model disappearing and `trend(hours=1)` to
+review memory changes. Trends are sampled when `vram_status()` reads the GPU;
+there is no background sampler. See [diagnostics](docs/coordination.md#diagnostics).
+
+## Tools
+
+The client's MCP schema provides full arguments and defaults.
+
+| Tool | Purpose |
+| --- | --- |
+| `vram_status` | Inspect GPU memory, models, claims, activity, and pressure. |
+| `list_loaded` | List resident models and their claim/busy details. |
+| `ensure_free` | Try to reach a free-memory target by unloading unprotected models. |
+| `unload` | Evict a named model, respecting claims and recent activity. |
+| `warm` | Load a model for a chosen `keep_alive`, checking reservations. |
+| `claim`, `reserve` | Declare model use or capacity needed for other GPU work. |
+| `renew`, `release` | Extend or end your claim or reservation. |
+| `list_claims` | See active model claims and capacity reservations. |
+| `history`, `trend` | Review recorded actions, observed changes, and memory samples. |
+| `advise` | Get configuration suggestions; no settings are changed. |
+
+## Guides
+
+| Guide | Read it for |
+| --- | --- |
+| [Configuration](docs/configuration.md) | Source installation, environment variables, and connection troubleshooting. |
+| [Coordination and diagnostics](docs/coordination.md) | Claims, reservations, protection limits, pressure, and audit history. |
 
 ## Development
 
-```bash
-pip install -e .
+```sh
+git clone https://github.com/sushiHex/vram-mcp.git
+cd vram-mcp
+python -m venv .venv
+```
+
+Activate with `source .venv/bin/activate` on Linux or
+`.\.venv\Scripts\Activate.ps1` in PowerShell, then run:
+
+```sh
+python -m pip install -e ".[dev]"
 python -m pytest -q
 ```
 
-The logic modules (`gpu.py`, `ollama.py`, `core.py`, `nvml.py`,
-`ollama_correlate.py`, `claims.py`) are free of any `mcp` import and are fully
-unit-tested with mocks — no real GPU, Ollama daemon, or `mcp` package required
-to run the test suite.
-
-## Roadmap
-
-- Other backends: AMD (ROCm/`rocm-smi`), Intel (`xpu-smi`).
-- Other runtimes: vLLM, llama.cpp.
+Tests use mocked GPU, process, and HTTP calls; no GPU or Ollama daemon is needed.
+CI covers Python 3.10–3.14 on Windows and Linux. Current model management targets
+Ollama and NVIDIA; AMD/Intel telemetry and vLLM/llama.cpp management are future
+work.
 
 ## License
 
-MIT © 2026 sushiHex
+MIT — see [LICENSE](LICENSE). Companion project:
+[hardline-mcp](https://github.com/sushiHex/hardline-mcp) for agent messaging.

@@ -1,10 +1,10 @@
 """Append-only, cause-attributed VRAM audit log + disappearance detector.
 
-One typed ``events.jsonl`` (``type`` in action|disappeared|appeared) plus a
-``last_seen.json`` diff baseline. Bounded (``cap`` events, pruned on append),
-crash-safe (atomic writes + the shared file lock). The audit MUST NEVER break a
-tool call: every write is best-effort. Pure w.r.t. time (``now_fn`` injected)
-and paths (injected in tests).
+One typed ``events.jsonl`` plus scoped holder baselines in ``last_seen.json``.
+Bounded (``cap`` events, pruned on append), crash-safe (atomic writes + the
+shared file lock). The audit MUST NEVER break a tool call: every write is
+best-effort. Pure w.r.t. time (``now_fn`` injected) and paths (injected in
+tests).
 """
 from __future__ import annotations
 
@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from ._util import append_jsonl_capped, iso, load_json, locked, parse_iso, read_jsonl, save_json_atomic
+from .models import canonical_model
 
 DEFAULT_EVENTS_PATH = Path.home() / ".cache" / "vram-mcp" / "events.jsonl"
 DEFAULT_LAST_SEEN_PATH = Path.home() / ".cache" / "vram-mcp" / "last_seen.json"
@@ -20,23 +21,46 @@ DEFAULT_SAMPLE_PATH = Path.home() / ".cache" / "vram-mcp" / "last_sample.json"
 SAMPLE_INTERVAL_SECONDS = 60.0
 
 _RECENT_ACTION_SECONDS = 10.0
+_HOLDER_KINDS = frozenset({"ollama", "process"})
+_ACTION_OUTCOMES = frozenset({"succeeded", "refused", "failed", "unknown"})
 
 
 def _default_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _canonical_target(target, kind: str):
+    if kind != "ollama":
+        return target
+    try:
+        return canonical_model(target)
+    except (TypeError, ValueError):
+        return target
+
+
+def _normalized_outcome(outcome: str) -> str:
+    # ``ok`` was written by releases before action outcomes were standardized.
+    if outcome == "ok":
+        return "succeeded"
+    return outcome if outcome in _ACTION_OUTCOMES else "unknown"
+
+
 def log_action(*, action: str, target: str, kind: str, actor: str = "unknown",
-               force: bool = False, outcome: str = "ok", detail: str = "",
+               force: bool = False, outcome: str = "succeeded", detail: str = "",
+               scope: str | None = None,
                now_fn=_default_now, path: Path = DEFAULT_EVENTS_PATH,
                cap: int = 5000) -> None:
     """Append one ``type="action"`` event. Best-effort — never raises."""
     try:
         event = {
-            "ts": iso(now_fn()), "type": "action", "kind": kind, "target": target,
+            "ts": iso(now_fn()), "type": "action", "kind": kind,
+            "target": _canonical_target(target, kind),
             "action": action, "actor": actor, "force": force, "outcome": outcome,
             "detail": detail,
         }
+        event["outcome"] = _normalized_outcome(outcome)
+        if scope is not None:
+            event["scope"] = scope
         with locked(path):
             append_jsonl_capped(path, event, cap)
     except Exception:
@@ -45,15 +69,21 @@ def log_action(*, action: str, target: str, kind: str, actor: str = "unknown",
 
 def read_events(*, model: str | None = None, type: str | None = None,
                 limit: int = 50, since: str | None = None,
+                scope: str | None = None,
                 path: Path = DEFAULT_EVENTS_PATH) -> list[dict]:
-    """Recent events, newest-first, optionally filtered by target/type/since."""
+    """Recent events, newest-first, optionally filtered by their fields."""
     rows = read_jsonl(path)
     if model is not None:
-        rows = [r for r in rows if r.get("target") == model]
+        canonical = _canonical_target(model, "ollama")
+        rows = [r for r in rows
+                if (_canonical_target(r.get("target"), r.get("kind")) == canonical
+                    if r.get("kind") == "ollama" else r.get("target") == model)]
     if type is not None:
         rows = [r for r in rows if r.get("type") == type]
     if since is not None:
         rows = [r for r in rows if r.get("ts", "") >= since]  # ISO-Z sorts lexically
+    if scope is not None:
+        rows = [r for r in rows if r.get("scope") == scope]
     rows.reverse()
     return rows[:limit]
 
@@ -66,6 +96,7 @@ def meaningful_holders(loaded_models, process_table, threshold_mb: int) -> list[
         name = m.get("name")
         if not name:
             continue
+        name = _canonical_target(name, "ollama")
         holders.append({"key": f"ollama:{name}", "target": name,
                         "kind": "ollama", "size_mb": m.get("size_vram_mb")})
     for p in process_table:
@@ -77,12 +108,19 @@ def meaningful_holders(loaded_models, process_table, threshold_mb: int) -> list[
     return holders
 
 
-def _recent_action_for(target: str, now: datetime, log_path: Path):
+def _recent_action_for(target: str, now: datetime, log_path: Path,
+                       scope: str | None = None):
     """The most recent unload/ensure_free action on ``target`` within the
     attribution window, else None. ``read_events`` is newest-first."""
     floor = now.timestamp() - _RECENT_ACTION_SECONDS
-    for e in read_events(model=target, type="action", limit=50, path=log_path):
+    for e in read_events(model=target, type="action", limit=5000, path=log_path):
+        # An action against another Ollama endpoint cannot explain this scope.
+        # Legacy/default observations only match legacy/default actions.
+        if e.get("scope") != scope:
+            continue
         if e.get("action") not in ("unload", "ensure_free"):
+            continue
+        if e.get("outcome") not in ("succeeded", "ok"):
             continue
         ts = e.get("ts")
         if not ts:
@@ -91,29 +129,39 @@ def _recent_action_for(target: str, now: datetime, log_path: Path):
             when = parse_iso(ts).timestamp()
         except ValueError:
             continue
-        if when >= floor:
+        if floor <= when <= now.timestamp():
             return e
     return None
 
 
-def _disappeared_event(holder: dict, now: datetime, log_path: Path) -> dict:
+def _disappeared_event(holder: dict, now: datetime, log_path: Path,
+                       scope: str | None = None) -> dict:
     kind = holder["kind"]
     if kind == "ollama":
-        action = _recent_action_for(holder["target"], now, log_path)
+        action = _recent_action_for(holder["target"], now, log_path, scope)
         if action is not None:
-            return {"ts": iso(now), "type": "disappeared", "kind": "ollama",
+            event = {"ts": iso(now), "type": "disappeared", "kind": "ollama",
                     "target": holder["target"], "size_mb": holder.get("size_mb"),
                     "cause": "self_action", "actor": action.get("actor", "unknown"),
                     "detail": f"removed by {action.get('actor','unknown')} via {action.get('action')}"}
-        return {"ts": iso(now), "type": "disappeared", "kind": "ollama",
+            if scope is not None:
+                event["scope"] = scope
+            return event
+        event = {"ts": iso(now), "type": "disappeared", "kind": "ollama",
                 "target": holder["target"], "size_mb": holder.get("size_mb"),
                 "cause": "external",
                 "detail": "no vram-mcp action recorded — Ollama idle-expiry, "
                           "memory-pressure eviction, or an external unload."}
-    return {"ts": iso(now), "type": "disappeared", "kind": "process",
+        if scope is not None:
+            event["scope"] = scope
+        return event
+    event = {"ts": iso(now), "type": "disappeared", "kind": "process",
             "target": holder["target"], "size_mb": holder.get("size_mb"),
             "cause": "unattributed",
             "detail": "process exited or was killed; vram-mcp cannot observe the cause."}
+    if scope is not None:
+        event["scope"] = scope
+    return event
 
 
 def _valid_baseline_exists(path: Path) -> bool:
@@ -129,37 +177,154 @@ def _valid_baseline_exists(path: Path) -> bool:
     return isinstance(doc, dict) and isinstance(doc.get("holders"), dict)
 
 
+def _normalize_holder(holder: dict) -> dict:
+    normalized = dict(holder)
+    kind = normalized.get("kind")
+    target = _canonical_target(normalized.get("target"), kind)
+    normalized["target"] = target
+    if kind == "ollama":
+        normalized["key"] = f"ollama:{target}"
+    return normalized
+
+
+def _normalize_holder_map(holders: dict) -> dict:
+    normalized = {}
+    for holder in holders.values():
+        if not isinstance(holder, dict) or holder.get("kind") not in _HOLDER_KINDS:
+            continue
+        item = _normalize_holder(holder)
+        key = item.get("key")
+        if key:
+            normalized[key] = item
+    return normalized
+
+
+def _observation_time(value, fallback: datetime) -> datetime:
+    when = fallback if value is None else (parse_iso(value) if isinstance(value, str) else value)
+    if not isinstance(when, datetime):
+        raise TypeError("observed_at must be a datetime or ISO timestamp")
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    return when.astimezone(timezone.utc)
+
+
+def _observation_iso(when: datetime) -> str:
+    """Preserve source precision so near-concurrent reads order correctly."""
+    return when.isoformat(timespec="microseconds").replace("+00:00", "Z")
+
+
+def _baseline_domain(state: dict, scope: str | None,
+                     default_existed: bool) -> tuple[dict, bool]:
+    """Return a baseline domain and whether it existed before this read."""
+    if scope is None:
+        return state, default_existed
+    scopes = state.setdefault("scopes", {})
+    if not isinstance(scopes, dict):
+        scopes = {}
+        state["scopes"] = scopes
+    existing = scopes.get(scope)
+    if isinstance(existing, dict) and isinstance(existing.get("holders"), dict):
+        return existing, True
+    domain = {"holders": {}, "observed_at": {}, "initialized_kinds": []}
+    scopes[scope] = domain
+    return domain, False
+
+
 def detect_and_log(current_holders, *, last_seen_path: Path = DEFAULT_LAST_SEEN_PATH,
                    log_path: Path = DEFAULT_EVENTS_PATH, now_fn=_default_now,
-                   cap: int = 5000) -> list[dict]:
-    """Diff ``current_holders`` against last-seen under the lock; append
-    disappeared/appeared events with attribution; rewrite last-seen. Returns the
-    events emitted. Best-effort — never raises out to the caller."""
+                   cap: int = 5000, observed_at=None,
+                   observed_kinds: set[str] | None = None,
+                   scope: str | None = None) -> list[dict]:
+    """Diff one successful observation against its scoped last-seen baseline.
+
+    ``None`` means the source was unavailable; a successful empty result is
+    represented by ``[]``. Only ``observed_kinds`` are diffed and replaced.
+    Older source timestamps are ignored. Returns emitted events and never
+    raises out to the caller.
+    """
     emitted: list[dict] = []
     try:
+        # ``None`` is the unavailable-reading sentinel. It must not turn every
+        # last-known holder into a disappearance.
+        if current_holders is None:
+            return []
+        kinds = (_HOLDER_KINDS if observed_kinds is None
+                 else frozenset(observed_kinds) & _HOLDER_KINDS)
+        if not kinds:
+            return []
         with locked(last_seen_path):
             now = now_fn()
-            first_run = not _valid_baseline_exists(last_seen_path)
+            source_time = _observation_time(observed_at, now)
+            state_existed = _valid_baseline_exists(last_seen_path)
             prev = load_json(last_seen_path, lambda: {"holders": {}},
                              lambda d: isinstance(d, dict) and isinstance(d.get("holders"), dict))
-            prev_map = prev["holders"]
-            cur_map = {h["key"]: h for h in current_holders}
+            domain, domain_existed = _baseline_domain(prev, scope, state_existed)
+            prev_map = _normalize_holder_map(domain["holders"])
+            cur_map = {}
+            for holder in current_holders:
+                if not isinstance(holder, dict) or holder.get("kind") not in kinds:
+                    continue
+                normalized = _normalize_holder(holder)
+                key = normalized.get("key")
+                if key:
+                    cur_map[key] = normalized
 
-            for key, h in prev_map.items():
-                if key not in cur_map:
-                    emitted.append(_disappeared_event(h, now, log_path))
-            if not first_run:
-                for key, h in cur_map.items():
-                    if key not in prev_map:
-                        emitted.append({
-                            "ts": iso(now), "type": "appeared", "kind": h["kind"],
-                            "target": h["target"], "size_mb": h.get("size_mb"),
-                            "detail": "now holding VRAM",
-                        })
+            recorded_times = domain.get("observed_at", {})
+            if not isinstance(recorded_times, dict):
+                recorded_times = {}
+            initialized = domain.get("initialized_kinds")
+            if not isinstance(initialized, list):
+                # A legacy valid baseline represented successful observation of
+                # both kinds, even though it did not save that metadata.
+                initialized = list(_HOLDER_KINDS) if domain_existed else []
+            initialized_set = set(initialized) & _HOLDER_KINDS
+
+            accepted_kinds = set()
+            for kind in kinds:
+                previous_time = recorded_times.get(kind)
+                if previous_time:
+                    try:
+                        if source_time < _observation_time(previous_time, now):
+                            continue
+                    except (TypeError, ValueError):
+                        pass
+                accepted_kinds.add(kind)
+
+            if not accepted_kinds:
+                return []
+
+            for kind in sorted(accepted_kinds):
+                old_for_kind = {key: h for key, h in prev_map.items()
+                                if h.get("kind") == kind}
+                new_for_kind = {key: h for key, h in cur_map.items()
+                                if h.get("kind") == kind}
+                for key, holder in old_for_kind.items():
+                    if key not in new_for_kind:
+                        emitted.append(_disappeared_event(holder, now, log_path, scope))
+                if kind in initialized_set:
+                    for key, holder in new_for_kind.items():
+                        if key not in old_for_kind:
+                            event = {
+                                "ts": iso(now), "type": "appeared", "kind": holder["kind"],
+                                "target": holder["target"], "size_mb": holder.get("size_mb"),
+                                "detail": "now holding VRAM",
+                            }
+                            if scope is not None:
+                                event["scope"] = scope
+                            emitted.append(event)
+
+                prev_map = {key: h for key, h in prev_map.items()
+                            if h.get("kind") != kind}
+                prev_map.update(new_for_kind)
+                recorded_times[kind] = _observation_iso(source_time)
+                initialized_set.add(kind)
 
             # Baseline is saved BEFORE we release the last_seen lock, so a
             # concurrent session already sees the holder gone and won't re-log it.
-            save_json_atomic(last_seen_path, {"holders": cur_map})
+            domain["holders"] = prev_map
+            domain["observed_at"] = recorded_times
+            domain["initialized_kinds"] = sorted(initialized_set)
+            save_json_atomic(last_seen_path, prev)
     except Exception:
         return emitted
     # Append events OUTSIDE the last_seen lock, under the EVENTS lock, so both
@@ -180,30 +345,48 @@ def detect_and_log(current_holders, *, last_seen_path: Path = DEFAULT_LAST_SEEN_
 def maybe_log_sample(sample: dict, *, interval_seconds: float = SAMPLE_INTERVAL_SECONDS,
                      state_path: Path = DEFAULT_SAMPLE_PATH,
                      log_path: Path = DEFAULT_EVENTS_PATH,
-                     now_fn=_default_now, cap: int = 5000) -> bool:
+                     now_fn=_default_now, cap: int = 5000,
+                     scope: str | None = None) -> bool:
     """Append one ``type="sample"`` event, at most once per ``interval_seconds``
-    across all sessions.
+    for each scope across all sessions.
 
     The throttle matters: ``events.jsonl`` is capped, and an unthrottled sample
     on every status call would evict the action/disappearance events that carry
     the real diagnostic value. The last-sample timestamp lives in its own small
-    state file under the shared lock, so concurrent sessions agree on the rate.
+    state file under the shared lock, so concurrent sessions agree on the rate
+    independently for each GPU scope.
 
     Returns True if a sample was written. Best-effort — never raises.
     """
     try:
+        if not isinstance(sample, dict):
+            return False
+        effective_scope = scope if scope is not None else sample.get("scope")
         now = now_fn()
         with locked(state_path):
             state = load_json(state_path, lambda: {},
                               lambda d: isinstance(d, dict))
-            last = state.get("ts")
+            if effective_scope is None:
+                sample_state = state
+            else:
+                scopes = state.setdefault("scopes", {})
+                if not isinstance(scopes, dict):
+                    scopes = {}
+                    state["scopes"] = scopes
+                sample_state = scopes.setdefault(effective_scope, {})
+                if not isinstance(sample_state, dict):
+                    sample_state = {}
+                    scopes[effective_scope] = sample_state
+            last = sample_state.get("ts")
             if last:
                 try:
-                    if (now - parse_iso(last)).total_seconds() < interval_seconds:
+                    elapsed = (now - parse_iso(last)).total_seconds()
+                    if elapsed < interval_seconds:
                         return False
                 except (ValueError, TypeError):
                     pass  # unparsable timestamp -> treat as never sampled
-            save_json_atomic(state_path, {"ts": iso(now)})
+            sample_state["ts"] = iso(now)
+            save_json_atomic(state_path, state)
     except Exception:
         return False
     # Appended OUTSIDE the state lock, under the EVENTS lock, so every writer of
@@ -211,7 +394,9 @@ def maybe_log_sample(sample: dict, *, interval_seconds: float = SAMPLE_INTERVAL_
     # event is inside the try too: ``**sample`` raises on a non-mapping, and
     # nothing here may escape to the caller.
     try:
-        event = {"ts": iso(now), "type": "sample", **sample}
+        event = {**sample, "ts": iso(now), "type": "sample"}
+        if effective_scope is not None:
+            event["scope"] = effective_scope
         with locked(log_path):
             append_jsonl_capped(log_path, event, cap)
     except Exception:

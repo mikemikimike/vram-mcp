@@ -1,17 +1,15 @@
-"""Minimal Ollama HTTP client.
-
-Pure module: no ``mcp`` import. Every method swallows transport errors and
-returns a benign default (``[]`` / ``False``) so callers never have to guard
-against a down Ollama daemon.
-"""
+"""Ollama transport with explicit read health and verified mutation outcomes."""
 
 from __future__ import annotations
 
+import time
 from typing import Optional
 
 import requests
 
 from ._util import bytes_to_mb
+from .observations import Observation
+from .models import canonical_model
 
 
 class OllamaClient:
@@ -62,6 +60,88 @@ class OllamaClient:
             return []
         models = data.get("models")
         return models if isinstance(models, list) else []
+
+    def observe_loaded(self) -> Observation[list[dict]]:
+        payload = self._get_json("/api/ps")
+        rows = payload.get("models") if isinstance(payload, dict) else None
+        if not isinstance(rows, list) or any(
+            not isinstance(row, dict) or not isinstance(row.get("name"), str)
+            or not row["name"].strip() for row in rows
+        ):
+            return Observation(None, "ollama:/api/ps", error="Ollama unavailable or invalid response",
+                               scope=self.base_url)
+        try:
+            rows = [{**row, "name": canonical_model(row["name"])} for row in rows]
+        except ValueError:
+            return Observation(None, "ollama:/api/ps", error="Invalid model name", scope=self.base_url)
+        return Observation(rows, "ollama:/api/ps", scope=self.base_url)
+
+    def observe_tags(self) -> Observation[dict]:
+        payload = self._get_json("/api/tags")
+        rows = payload.get("models") if isinstance(payload, dict) else None
+        if not isinstance(rows, list):
+            return Observation(None, "ollama:/api/tags", error="Ollama unavailable or invalid response",
+                               scope=self.base_url)
+        sizes = {}
+        for row in rows:
+            if not isinstance(row, dict) or not isinstance(row.get("name"), str) or not row["name"].strip():
+                return Observation(None, "ollama:/api/tags", error="Invalid model entry", scope=self.base_url)
+            size = bytes_to_mb(row.get("size"))
+            if size is not None and size > 0:
+                try:
+                    sizes[canonical_model(row["name"])] = size
+                except ValueError:
+                    return Observation(None, "ollama:/api/tags", error="Invalid model name", scope=self.base_url)
+        return Observation(sizes, "ollama:/api/tags", scope=self.base_url)
+
+    def change_residency(self, model: str, keep_alive, *, resident: bool,
+                         attempts: int = 3, sleep=time.sleep) -> dict:
+        """Send once; reconcile with bounded reads, never blindly retry a POST.
+
+        A timeout may have changed the server. For warm, residency alone cannot
+        prove that the requested keep-alive was applied, so no acknowledgement
+        remains an unknown outcome even if the model is now resident.
+        """
+        model = canonical_model(model)
+        acknowledged = False
+        error = None
+        try:
+            response = self.session.post(self._url("/api/generate"), json={
+                "model": model, "prompt": "", "keep_alive": -1 if keep_alive == "-1" else keep_alive,
+                "stream": False,
+            }, timeout=self.timeout)
+            acknowledged = 200 <= response.status_code < 300
+            if 400 <= response.status_code < 500:
+                return {"ok": False, "outcome": "failed", "model": model,
+                        "detail": f"Ollama rejected the request (HTTP {response.status_code})"}
+            if not acknowledged:
+                error = f"Ollama returned HTTP {response.status_code}"
+            else:
+                try:
+                    payload = response.json()
+                except ValueError:
+                    payload = None
+                acknowledged = isinstance(payload, dict) and payload.get("done") is True and not payload.get("error")
+                if not acknowledged:
+                    error = "Ollama did not return a valid completion acknowledgement"
+        except requests.RequestException:
+            error = "Ollama request was interrupted; it may still be running"
+        reading = None
+        observed_resident = None
+        for attempt in range(attempts):
+            if attempt:
+                sleep(0.2)
+            reading = self.observe_loaded()
+            if reading.known:
+                observed_resident = any(canonical_model(row["name"]) == model for row in reading.data)
+                if observed_resident == resident and (acknowledged or not resident):
+                    return {"ok": True, "outcome": "succeeded", "model": model,
+                            "resident": observed_resident, "observations": {"ollama": reading.metadata()},
+                            "detail": "Residency verified after request"}
+        return {"ok": False, "outcome": "unknown", "model": model,
+                "resident": observed_resident,
+                "observations": {"ollama": reading.metadata()} if reading else {},
+                "detail": error or "Ollama acknowledged the request, but residency could not be verified"}
 
     def tags(self) -> dict:
         """``{model_name: size_mb}`` from ``/api/tags`` (on-disk sizes).

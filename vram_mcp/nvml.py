@@ -10,9 +10,11 @@ not just ``NVMLError`` but also e.g. ``AttributeError`` from the legacy
 
 from __future__ import annotations
 
+import time
 from typing import Optional
 
 from ._util import bytes_to_mb as _shared_bytes_to_mb
+from .observations import Observation
 
 
 def _default_nvml():
@@ -90,24 +92,68 @@ def nvml_processes(device_index: int = 0, *, nvml=None) -> list[dict]:
     independently — if one is unsupported, the other's results still come
     back. ``[]`` if NVML is unavailable entirely.
     """
-    if nvml is None:
-        nvml = _default_nvml()
+    observation = observe_processes(device_index, nvml=nvml)
+    return observation.data or []
 
-    def _query(nvml, handle):
+
+def observe_processes(
+    index: int = 0, *, nvml=None,
+) -> Observation[list[dict]]:
+    """Observe processes attached to exactly one NVML device.
+
+    Successful empty results remain distinguishable from NVML initialization,
+    device lookup, or query failures. Compute and graphics process queries are
+    independent; either supported query is enough for a known observation.
+    """
+    source = "nvml"
+    scope = f"gpu:index={index}"
+    no_coverage = {"compute_processes": False, "graphics_processes": False}
+    if nvml is None:
+        try:
+            nvml = _default_nvml()
+        except Exception as exc:
+            return Observation(
+                None, source, error=str(exc), scope=scope, coverage=no_coverage,
+            )
+
+    try:
+        nvml.nvmlInit()
+    except Exception as exc:
+        return Observation(
+            None, source, error=str(exc), scope=scope, coverage=no_coverage,
+        )
+    try:
+        try:
+            handle = nvml.nvmlDeviceGetHandleByIndex(index)
+        except Exception as exc:
+            return Observation(
+                None, source, error=str(exc), scope=scope, coverage=no_coverage,
+            )
+
         out: list[dict] = []
         by_pid: dict[int, dict] = {}
+        query_successes = 0
+        errors: list[str] = []
+        compute_ok = False
+        graphics_ok = False
         try:
             compute = nvml.nvmlDeviceGetComputeRunningProcesses_v3(handle)
-        except Exception:
+            query_successes += 1
+            compute_ok = True
+        except Exception as exc:
             compute = []
+            errors.append(str(exc))
         for p in compute:
             entry = {"pid": p.pid, "size_mb": _b2mb(p.usedGpuMemory), "kind": "compute"}
             out.append(entry)
             by_pid[p.pid] = entry
         try:
             graphics = nvml.nvmlDeviceGetGraphicsRunningProcesses_v3(handle)
-        except Exception:
+            query_successes += 1
+            graphics_ok = True
+        except Exception as exc:
             graphics = []
+            errors.append(str(exc))
         for p in graphics:
             size = _b2mb(p.usedGpuMemory)
             existing = by_pid.get(p.pid)
@@ -116,12 +162,39 @@ def nvml_processes(device_index: int = 0, *, nvml=None) -> list[dict]:
                     existing["size_mb"] = size
                 continue
             out.append({"pid": p.pid, "size_mb": size, "kind": "graphics"})
-        return out
+        if query_successes == 0:
+            detail = "; ".join(error for error in errors if error)
+            return Observation(
+                None, source, error=detail or "NVML process queries failed",
+                scope=scope, coverage=no_coverage,
+            )
+        return Observation(
+            out, source, scope=scope,
+            coverage={
+                "compute_processes": compute_ok,
+                "graphics_processes": graphics_ok,
+            },
+        )
+    except Exception as exc:
+        return Observation(
+            None, source, error=str(exc) or "Invalid NVML process response",
+            scope=scope, coverage=no_coverage,
+        )
+    finally:
+        try:
+            nvml.nvmlShutdown()
+        except Exception:
+            pass
 
-    return _with_device(nvml, device_index, _query, [])
 
-
-def nvml_busy_map(pids, device_index: int = 0, *, nvml=None) -> dict:
+def nvml_busy_map(
+    pids,
+    index: int = 0,
+    *,
+    nvml=None,
+    now_fn=time.time,
+    recent_seconds: float = 5.0,
+) -> dict:
     """Busy signal for MANY pids in ONE NVML session + ONE utilization-buffer fetch.
 
     Returns ``{pid: True|False|None}`` for every pid in ``pids``: ``True`` if
@@ -131,22 +204,29 @@ def nvml_busy_map(pids, device_index: int = 0, *, nvml=None) -> dict:
     for a PID we simply have no data on. Empty ``pids`` returns ``{}``
     without touching NVML.
 
-    Uses ``nvmlDeviceGetProcessUtilization(handle, 0)`` — ``0`` returns every
-    sample in NVML's own short internal buffer, not a single instant, so a
-    brief idle gap between generated tokens doesn't read as "idle" the way a
-    single-shot snapshot could.
+    Requests and independently filters samples newer than ``recent_seconds``.
+    NVML timestamps are epoch microseconds. A PID represented only by stale
+    samples remains ``None`` rather than being mislabeled busy or idle.
     """
     pids = list(pids)
     if not pids:
         return {}
     if nvml is None:
-        nvml = _default_nvml()
+        try:
+            nvml = _default_nvml()
+        except Exception:
+            return {pid: None for pid in pids}
+
+    cutoff_us = max(0, int((float(now_fn()) - recent_seconds) * 1_000_000))
 
     def _query(nvml, handle):
         verdicts: dict = {pid: None for pid in pids}
         wanted = set(pids)
-        for s in nvml.nvmlDeviceGetProcessUtilization(handle, 0):
+        for s in nvml.nvmlDeviceGetProcessUtilization(handle, cutoff_us):
             if s.pid not in wanted:
+                continue
+            timestamp = getattr(s, "timeStamp", None)
+            if timestamp is None or timestamp < cutoff_us:
                 continue
             if s.smUtil > 0:
                 verdicts[s.pid] = True
@@ -154,10 +234,17 @@ def nvml_busy_map(pids, device_index: int = 0, *, nvml=None) -> dict:
                 verdicts[s.pid] = False
         return verdicts
 
-    return _with_device(nvml, device_index, _query, {pid: None for pid in pids})
+    return _with_device(nvml, index, _query, {pid: None for pid in pids})
 
 
-def nvml_busy(pid: int, device_index: int = 0, *, nvml=None) -> Optional[bool]:
+def nvml_busy(
+    pid: int,
+    index: int = 0,
+    *,
+    nvml=None,
+    now_fn=time.time,
+    recent_seconds: float = 5.0,
+) -> Optional[bool]:
     """Was ``pid`` doing GPU compute recently (windowed, not point-in-time)?
 
     Thin wrapper over :func:`nvml_busy_map` for a single pid — same semantics:
@@ -168,4 +255,6 @@ def nvml_busy(pid: int, device_index: int = 0, *, nvml=None) -> Optional[bool]:
     vram-mcp's own server path uses :func:`nvml_busy_map` (one NVML session
     for all pids).
     """
-    return nvml_busy_map([pid], device_index, nvml=nvml).get(pid)
+    return nvml_busy_map(
+        [pid], index, nvml=nvml, now_fn=now_fn, recent_seconds=recent_seconds,
+    ).get(pid)

@@ -37,7 +37,7 @@ def test_claim_creates_and_list_claims_returns_it(tmp_path):
 
     active = claims.list_claims(path=path, now_fn=now_fn)
     assert len(active) == 1
-    assert active[0]["model"] == "llama3.2"
+    assert active[0]["model"] == "llama3.2:latest"
     assert active[0]["owner"] == "project-a"
     assert active[0]["purpose"] == "narration"
 
@@ -125,77 +125,7 @@ def test_sequential_claims_both_persist(tmp_path):
     assert len(claims.list_claims(path=path, now_fn=now_fn)) == 2
 
 
-def test_locked_raises_timeout_if_lock_file_already_held(tmp_path):
-    import os
-    path = tmp_path / "claims.json"
-    lock_path = path.with_suffix(path.suffix + ".lock")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-    try:
-        os.utime(lock_path, None)  # mtime = NOW: a LIVE lock, not a stale one
-        with pytest.raises(TimeoutError):
-            with claims._locked(path, timeout=0.2, poll=0.05):
-                pass
-    finally:
-        os.close(fd)
-        os.remove(lock_path)
-
-
-# --- FIX 1: stale locks from hard-killed holders are broken, live ones honored
-
-
-def test_stale_lock_is_broken_and_claim_succeeds(tmp_path):
-    import os
-    import time
-    path = tmp_path / "claims.json"
-    lock_path = path.with_suffix(path.suffix + ".lock")
-    lock_path.write_text("9999 2026-07-13T00:00:00Z\n")  # abandoned holder
-    old = time.time() - (_util.LOCK_STALE_SECONDS + 30)
-    os.utime(lock_path, (old, old))
-
-    now_fn = _clock(_T0)
-    result = claims.claim("llama3.2", "a", "x", path=path, now_fn=now_fn)
-    assert "claim_id" in result
-    assert len(claims.list_claims(path=path, now_fn=now_fn)) == 1
-    assert not lock_path.exists()  # broken, then released after the write
-
-
-def test_stale_lock_break_tolerates_losing_the_removal_race(tmp_path):
-    """os.remove of the stale lock may hit FileNotFoundError if another
-    process broke it first — _locked must swallow that and retry."""
-    import os
-    import time
-    path = tmp_path / "claims.json"
-    lock_path = path.with_suffix(path.suffix + ".lock")
-    lock_path.write_text("stale\n")
-    old = time.time() - (_util.LOCK_STALE_SECONDS + 30)
-    os.utime(lock_path, (old, old))
-
-    real_remove = os.remove
-
-    def racing_remove(p):
-        real_remove(p)  # "another process" already removed it...
-        raise FileNotFoundError(2, "gone", str(p))  # ...so ours would raise
-
-    raced = {"done": False}
-
-    def remove_once(p):
-        if not raced["done"] and str(p) == str(lock_path):
-            raced["done"] = True
-            return racing_remove(p)
-        return real_remove(p)
-
-    original = _util.os.remove
-    _util.os.remove = remove_once
-    try:
-        with claims._locked(path, timeout=1.0):
-            pass
-    finally:
-        _util.os.remove = original
-    assert raced["done"]
-
-
-# --- FIX 2: _save retries os.replace on Windows sharing violations
+# --- _save retries os.replace on Windows sharing violations
 
 
 def test_save_retries_replace_on_permission_error_then_succeeds(tmp_path, monkeypatch):
@@ -262,24 +192,20 @@ def test_malformed_records_are_skipped_not_fatal(tmp_path):
     assert {r["model"] for r in on_disk["claims"]} == {"llama3.2", "qwen3:8b"}
 
 
-# --- FIX 4: corrupt / wrong-shape files are preserved aside, not wiped
+# --- corrupt/wrong-shape ledgers fail closed
 
 
 @pytest.mark.parametrize("content", ["[]", "{}", "{{{not json", '{"claims": 42}'])
-def test_corrupt_file_renamed_aside_and_ops_continue(tmp_path, content):
+def test_corrupt_file_raises_without_quarantining_or_overwriting(tmp_path, content):
     path = tmp_path / "claims.json"
     corrupt_path = path.with_suffix(path.suffix + ".corrupt")
     path.write_text(content, encoding="utf-8")
 
     now_fn = _clock(_T0)
-    assert claims.list_claims(path=path, now_fn=now_fn) == []  # no raise
-    assert corrupt_path.exists()
-    assert corrupt_path.read_text(encoding="utf-8") == content  # preserved
-
-    # Subsequent operations work on a fresh ledger.
-    created = claims.claim("llama3.2", "a", "x", path=path, now_fn=now_fn)
-    assert len(claims.list_claims(path=path, now_fn=now_fn)) == 1
-    assert claims.release(created["claim_id"], path=path) == {"ok": True}
+    with pytest.raises(ValueError):
+        claims.list_claims(path=path, now_fn=now_fn)
+    assert path.read_text(encoding="utf-8") == content
+    assert not corrupt_path.exists()
 
 
 def test_missing_file_is_not_treated_as_corrupt(tmp_path):
@@ -312,7 +238,7 @@ def test_expired_records_are_pruned_by_next_write(tmp_path):
 
     on_disk = json.loads(path.read_text(encoding="utf-8"))
     assert len(on_disk["claims"]) == 1  # expired record physically removed
-    assert on_disk["claims"][0]["model"] == "new-model"
+    assert on_disk["claims"][0]["model"] == "new-model:latest"
 
 
 def test_renew_prunes_expired_records_but_keeps_renewed_one(tmp_path):
@@ -327,7 +253,7 @@ def test_renew_prunes_expired_records_but_keeps_renewed_one(tmp_path):
     assert result["ok"] is True
 
     on_disk = json.loads(path.read_text(encoding="utf-8"))
-    assert [r["model"] for r in on_disk["claims"]] == ["keeper"]
+    assert [r["model"] for r in on_disk["claims"]] == ["keeper:latest"]
 
 
 def test_release_prunes_with_injected_clock_sibling_survives(tmp_path):
@@ -419,3 +345,163 @@ def test_reservation_can_be_released(tmp_path):
     r = claims.reserve(8.0, "trainer", "dpo", 3600, path=path, now_fn=lambda: now)
     assert claims.release(r["claim_id"], path=path, now_fn=lambda: now)["ok"]
     assert claims.list_claims(path=path, now_fn=lambda: now) == []
+
+
+def test_model_claims_canonicalize_bare_names_and_registry_ports(tmp_path):
+    now = lambda: _T0
+    path = tmp_path / "claims.json"
+    claims.claim("  llama3.2  ", "owner", "work", path=path, now_fn=now)
+    claims.claim("localhost:5000/library/foo", "owner", "work", path=path, now_fn=now)
+    assert [r["model"] for r in claims.list_claims(path=path, now_fn=now)] == [
+        "llama3.2:latest", "localhost:5000/library/foo:latest",
+    ]
+    assert len(claims.list_claims("llama3.2", path=path, now_fn=now)) == 1
+    assert len(claims.list_claims("localhost:5000/library/foo", path=path, now_fn=now)) == 1
+
+
+@pytest.mark.parametrize("alias", ["llama3", "library/llama3:latest",
+                                   "registry.ollama.ai/library/llama3",
+                                   "https://registry.ollama.ai/library/llama3:latest"])
+def test_official_model_aliases_share_one_protection_key(tmp_path, alias):
+    path = tmp_path / "claims.json"
+    claims.claim(alias, "owner", "purpose", path=path, now_fn=lambda: _T0)
+    result = claims.begin_operation("REGISTRY.OLLAMA.AI/library/LLAMA3", "unload",
+                                    path=path, now_fn=lambda: _T0)
+    assert result["reason"] == "model_claimed"
+    assert result["claims"][0]["model"] == "llama3:latest"
+
+
+@pytest.mark.parametrize("model", ["model:", "library//model", "https://registry.ollama.ai/"])
+def test_claim_rejects_malformed_model_alias(tmp_path, model):
+    with pytest.raises(ValueError):
+        claims.claim(model, "owner", "purpose", path=tmp_path / "claims.json", now_fn=lambda: _T0)
+
+
+@pytest.mark.parametrize("model, owner, purpose", [
+    ("", "owner", "purpose"), ("model", " ", "purpose"),
+    ("model", "owner", "\t"),
+])
+def test_claim_rejects_blank_coordination_identity(tmp_path, model, owner, purpose):
+    with pytest.raises(ValueError):
+        claims.claim(model, owner, purpose, path=tmp_path / "claims.json", now_fn=lambda: _T0)
+
+
+@pytest.mark.parametrize("ttl", [0, -1, float("inf"), float("nan"), 0.5, 10 ** 20])
+def test_claim_and_reservation_reject_invalid_ttl(tmp_path, ttl):
+    path = tmp_path / "claims.json"
+    with pytest.raises(ValueError):
+        claims.claim("model", "owner", "purpose", ttl, path=path, now_fn=lambda: _T0)
+    with pytest.raises(ValueError):
+        claims.reserve(1, "owner", "purpose", ttl, path=path, now_fn=lambda: _T0)
+
+
+@pytest.mark.parametrize("gb", [float("inf"), float("-inf"), float("nan"), True, 10 ** 1000])
+def test_reserve_rejects_nonfinite_gb(tmp_path, gb):
+    with pytest.raises(ValueError):
+        claims.reserve(gb, "owner", "purpose", path=tmp_path / "claims.json", now_fn=lambda: _T0)
+
+
+def test_renew_rejects_invalid_ttl_without_expiring_live_claim(tmp_path):
+    path = tmp_path / "claims.json"
+    created = claims.claim("model", "owner", "purpose", path=path, now_fn=lambda: _T0)
+    with pytest.raises(ValueError):
+        claims.renew(created["claim_id"], -1, path=path, now_fn=lambda: _T0)
+    assert len(claims.list_claims(path=path, now_fn=lambda: _T0)) == 1
+
+
+def test_begin_operation_refuses_claimed_model_and_returns_claim_detail(tmp_path):
+    path = tmp_path / "claims.json"
+    claims.claim("model", "owner", "purpose", path=path, now_fn=lambda: _T0)
+    result = claims.begin_operation("model", "unload", path=path, now_fn=lambda: _T0)
+    assert result["ok"] is False
+    assert result["reason"] == "model_claimed"
+    assert result["claims"][0]["model"] == "model:latest"
+
+
+def test_pending_operation_refuses_claim_and_same_model_force_operation(tmp_path):
+    path = tmp_path / "claims.json"
+    started = claims.begin_operation("model", "unload", force=True, path=path, now_fn=lambda: _T0)
+    try:
+        with pytest.raises(ValueError, match="operation pending"):
+            claims.claim("model", "owner", "purpose", path=path, now_fn=lambda: _T0)
+        refused = claims.begin_operation("model", "unload", force=True, path=path, now_fn=lambda: _T0)
+        assert refused["reason"] == "operation_pending"
+    finally:
+        assert claims.finish_operation(started["operation_id"], path=path, now_fn=lambda: _T0)["ok"]
+
+
+def test_live_operation_owner_prevents_expired_lease_from_admitting_race(tmp_path):
+    path = tmp_path / "claims.json"
+    clock = _clock(_T0)
+    started = claims.begin_operation("model", "unload", force=True, path=path, now_fn=clock)
+    try:
+        clock.tick(claims._OPERATION_LEASE_SECONDS + 1)
+        refused = claims.begin_operation("model", "unload", force=True, path=path, now_fn=clock)
+        assert refused["reason"] == "operation_pending"
+    finally:
+        claims.finish_operation(started["operation_id"], path=path, now_fn=clock)
+    next_started = claims.begin_operation("model", "unload", force=True, path=path, now_fn=clock)
+    assert next_started["ok"]
+    claims.finish_operation(next_started["operation_id"], path=path, now_fn=clock)
+
+
+def test_uncertain_operation_releases_owner_lock_but_renews_durable_grace(tmp_path):
+    path = tmp_path / "claims.json"
+    clock = _clock(_T0)
+    started = claims.begin_operation("model", "unload", force=True, path=path, now_fn=clock)
+    finished = claims.finish_operation(started["operation_id"], uncertain=True, path=path, now_fn=clock)
+    assert finished["ok"] is True
+    assert finished["retained"] is True
+    assert finished["expires_at"] == "2026-07-13T18:02:00Z"
+    refused = claims.begin_operation("model", "unload", force=True, path=path, now_fn=clock)
+    assert refused["reason"] == "operation_pending"
+    clock.tick(claims._OPERATION_LEASE_SECONDS + 1)
+    next_started = claims.begin_operation("model", "unload", force=True, path=path, now_fn=clock)
+    assert next_started["ok"]
+    claims.finish_operation(next_started["operation_id"], path=path, now_fn=clock)
+
+
+@pytest.mark.parametrize("operation", ["bad", {"operation_id": "op"},
+                                         {"operation_id": "op", "model": "model"}])
+def test_malformed_existing_operation_fails_closed(tmp_path, operation):
+    path = tmp_path / "claims.json"
+    path.write_text(json.dumps({"claims": [], "operations": [operation]}), encoding="utf-8")
+    with pytest.raises(ValueError, match="malformed operation"):
+        claims.begin_operation("model", "unload", path=path, now_fn=lambda: _T0)
+
+
+def test_warm_operations_serialize_capacity_admission_by_scope(tmp_path):
+    path = tmp_path / "claims.json"
+    first = claims.begin_operation("one", "warm", force=True, path=path, now_fn=lambda: _T0)
+    try:
+        refused = claims.begin_operation("two", "warm", force=True, path=path, now_fn=lambda: _T0)
+        assert refused["reason"] == "capacity_pending"
+        allowed = claims.begin_operation("two", "warm", force=True, path=path,
+                                         now_fn=lambda: _T0, scope="gpu:index=1")
+        assert allowed["ok"]
+        claims.finish_operation(allowed["operation_id"], path=path, now_fn=lambda: _T0)
+    finally:
+        claims.finish_operation(first["operation_id"], path=path, now_fn=lambda: _T0)
+
+
+def test_live_aged_warm_owner_still_blocks_same_scope_admission(tmp_path):
+    path = tmp_path / "claims.json"
+    clock = _clock(_T0)
+    first = claims.begin_operation("one", "warm", force=True, path=path, now_fn=clock)
+    try:
+        clock.tick(claims._OPERATION_LEASE_SECONDS + 1)
+        refused = claims.begin_operation("two", "warm", force=True, path=path, now_fn=clock)
+        assert refused["reason"] == "capacity_pending"
+    finally:
+        claims.finish_operation(first["operation_id"], path=path, now_fn=clock)
+
+
+def test_reservation_waits_for_any_warm_admission_to_resolve(tmp_path):
+    path = tmp_path / "claims.json"
+    started = claims.begin_operation("model", "warm", force=True, path=path, now_fn=lambda: _T0)
+    try:
+        with pytest.raises(ValueError, match="warm admission pending"):
+            claims.reserve(8, "owner", "purpose", path=path, now_fn=lambda: _T0)
+    finally:
+        claims.finish_operation(started["operation_id"], path=path, now_fn=lambda: _T0)
+    assert claims.reserve(8, "owner", "purpose", path=path, now_fn=lambda: _T0)["claim_id"]

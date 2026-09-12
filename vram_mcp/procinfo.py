@@ -3,9 +3,8 @@
 NVML gives per-process VRAM directly on Linux/TCC but returns ``None`` on
 Windows/WDDM. There, the ``\\GPU Process Memory(*)`` performance counters (the
 source Task Manager uses), summed per PID and joined with ``Get-CimInstance
-Win32_Process`` for the name/cmdline, supply both size and label in one call.
-``Dedicated Usage`` is real VRAM; ``Non Local Usage`` is VRAM the driver spilled
-into system RAM — the severe multi-x slowdown mode, invisible to NVML. Pure
+Win32_Process``, can label holders. Their memory totals aggregate adapters, so
+they are never assigned to a selected GPU without an adapter mapping. Pure
 module: every external reader is injected; each degrades to ``[]``/``{}`` on any
 failure and never raises.
 """
@@ -16,6 +15,8 @@ import sys
 from typing import Optional
 
 from ._util import bytes_to_mb, run_capture
+from .observations import Observation
+from . import nvml as _nvml
 
 # ONE Get-Counter call sampling all three counters, so the ~1 s perf-counter
 # cost is paid once. Samples are discriminated by their Path (which the counter
@@ -46,11 +47,12 @@ def _run_powershell(command: str, timeout: int) -> Optional[str]:
 
 
 def win_gpu_procs(timeout: int = 10) -> list[dict]:
-    """``[{pid,size_mb,shared_mb,non_local_mb,name,cmdline}]`` per GPU-memory
-    holder on Windows. ``size_mb`` is Dedicated Usage (real VRAM);
-    ``non_local_mb`` is Non Local Usage — VRAM the driver spilled to system RAM,
-    the severe multi-x slowdown mode. ``[]`` off-Windows or on any failure. ~1 s:
-    all three counters come from ONE sample, so the cost is that of one.
+    """Return adapter-aggregated Windows GPU counters and process identity.
+
+    ``size_mb`` is Dedicated Usage and ``non_local_mb`` is Non Local Usage, but
+    neither identifies an adapter. Selected-device callers may use `name` and
+    `cmdline`; they must leave these memory fields unavailable. Returns ``[]``
+    off-Windows or on any failure. All counters come from one ~1-second sample.
     """
     if sys.platform != "win32":
         return []
@@ -97,42 +99,92 @@ def posix_name_reader(pids, timeout: int = 5) -> dict:
     return names
 
 
-def process_table(*, nvml_processes, win_gpu_reader=None,
-                  posix_name_reader=None) -> list[dict]:
-    """``[{pid,size_mb,shared_mb,non_local_mb,name,cmdline,kind}]`` for GPU VRAM
-    holders.
-
-    Starts from NVML (pids + kind + size where available). When
-    ``win_gpu_reader`` is given (Windows), its dedicated-VRAM size + spill sizes
-    + name + cmdline are authoritative and fill NVML's null sizes and add any
-    pids NVML missed. Otherwise ``posix_name_reader`` supplies names for NVML's
-    pids and the spill fields stay ``None`` — NVML cannot report them, and
-    "unreported" must not read as "no spill".
-    """
-    table: dict = {}
-    for p in nvml_processes():
-        table[p["pid"]] = {
+def _base_table(rows: list[dict]) -> dict[int, dict]:
+    """Normalize selected-device NVML rows into the public process shape."""
+    return {
+        p["pid"]: {
             "pid": p["pid"], "size_mb": p.get("size_mb"),
             "shared_mb": None, "non_local_mb": None,
             "name": None, "cmdline": None, "kind": p.get("kind", "compute"),
         }
-    if win_gpu_reader is not None:
-        for w in win_gpu_reader():
-            entry = table.get(w["pid"])
+        for p in rows
+    }
+
+
+def _enrich_processes(
+    rows: list[dict], *, platform: str, win_gpu_reader=None,
+    posix_reader=None,
+) -> list[dict]:
+    """Attach process identity without weakening selected-GPU attribution.
+
+    Windows GPU Process Memory counters aggregate a PID across adapters. Their
+    name and command line are useful, but their memory values cannot be assigned
+    to one selected GPU. Consequently they never fill memory fields or add a
+    PID that NVML did not report for the selected device.
+    """
+    table = _base_table(rows)
+    if platform == "win32" and win_gpu_reader is not None:
+        for windows_row in win_gpu_reader():
+            entry = table.get(windows_row["pid"])
             if entry is None:
-                entry = {"pid": w["pid"], "size_mb": None, "shared_mb": None,
-                         "non_local_mb": None, "name": None, "cmdline": None,
-                         "kind": "compute"}
-                table[w["pid"]] = entry
-            entry["size_mb"] = w.get("size_mb")
-            entry["shared_mb"] = w.get("shared_mb")
-            entry["non_local_mb"] = w.get("non_local_mb")
-            entry["name"] = w.get("name")
-            entry["cmdline"] = w.get("cmdline")
-    elif posix_name_reader is not None:
-        names = posix_name_reader(list(table.keys()))
+                continue
+            entry["name"] = windows_row.get("name")
+            entry["cmdline"] = windows_row.get("cmdline")
+    elif platform != "win32" and posix_reader is not None:
+        names = posix_reader(list(table.keys()))
         for pid, meta in names.items():
             if pid in table:
                 table[pid]["name"] = meta.get("name")
                 table[pid]["cmdline"] = meta.get("cmdline")
     return list(table.values())
+
+
+def observe_processes(
+    index: int = 0,
+    *,
+    nvml=None,
+    platform: Optional[str] = None,
+    nvml_observer=None,
+    win_gpu_reader=None,
+    posix_reader=None,
+) -> Observation[list[dict]]:
+    """Observe process holders for one selected GPU with platform enrichment."""
+    platform = sys.platform if platform is None else platform
+    nvml_observer = nvml_observer or _nvml.observe_processes
+    win_gpu_reader = win_gpu_procs if win_gpu_reader is None else win_gpu_reader
+    posix_reader = posix_name_reader if posix_reader is None else posix_reader
+    nvml_observation = nvml_observer(index, nvml=nvml)
+    source = "nvml+windows-process-counters" if platform == "win32" else "nvml+ps"
+    scope = f"gpu:index={index}"
+    coverage = {**(nvml_observation.coverage or {}), "non_local_memory": False}
+    if not nvml_observation.known:
+        return Observation(
+            None, source, observed_at=nvml_observation.observed_at,
+            error=nvml_observation.error or "NVML process telemetry unavailable",
+            scope=scope, coverage=coverage,
+        )
+    rows = _enrich_processes(
+        nvml_observation.data or [], platform=platform,
+        win_gpu_reader=win_gpu_reader, posix_reader=posix_reader,
+    )
+    return Observation(
+        rows, source, observed_at=nvml_observation.observed_at, scope=scope,
+        coverage=coverage,
+    )
+
+
+def process_table(*, nvml_processes, win_gpu_reader=None,
+                  posix_name_reader=None, platform: Optional[str] = None) -> list[dict]:
+    """``[{pid,size_mb,shared_mb,non_local_mb,name,cmdline,kind}]`` for GPU VRAM
+    holders.
+
+    Starts from selected-device NVML rows. Platform dispatch is explicit:
+    Windows counters supply names only, while POSIX uses ``ps``. Memory fields
+    from adapter-aggregated Windows counters remain ``None`` unless a future
+    collector can prove adapter attribution.
+    """
+    selected_platform = sys.platform if platform is None else platform
+    return _enrich_processes(
+        nvml_processes(), platform=selected_platform,
+        win_gpu_reader=win_gpu_reader, posix_reader=posix_name_reader,
+    )

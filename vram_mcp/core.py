@@ -7,11 +7,13 @@ module is exercisable with plain fakes in tests. No ``mcp`` import.
 
 from __future__ import annotations
 
+import math
 import time
 from typing import Callable, Optional
 
-from . import gpu as _gpu
 from ._util import bytes_to_mb as _shared_bytes_to_mb
+from .models import canonical_model
+from .observations import Observation
 
 _MB_PER_GB = 1024
 
@@ -19,29 +21,25 @@ SPILL_THRESHOLD_MB = 256   # floor only; pressure() also compares against free V
 TIGHT_MB = 1024
 
 
-def _bytes_to_mb(value) -> int:
-    """Bytes -> whole MB; 0 for missing/garbage (a number is always expected here)."""
-    return _shared_bytes_to_mb(value, default=0)
+def observe_loaded(ollama) -> Observation[list[dict]]:
+    """Use transport health when available; plain injected clients supply data."""
+    if hasattr(ollama, "observe_loaded"):
+        return ollama.observe_loaded()
+    return Observation(ollama.ps(), "ollama:/api/ps")
 
 
-def _loaded_models(ollama) -> list[dict]:
-    """Normalize ``ollama.ps()`` rows to the base per-model status dict.
-
-    ``offloaded_to_cpu`` is True when ``size_vram_mb < total_size_mb`` — part
-    of the model spilled to system RAM. When the raw row doesn't carry a
-    ``size`` field at all, ``total_size_mb`` is 0 and offload can't be
-    detected (reported as False, never a guess of True).
-    """
+def _loaded_models(ollama=None, *, rows=None) -> list[dict]:
+    """Normalize model rows; absent memory readings remain unknown."""
     loaded = []
-    for m in ollama.ps():
-        size_mb = _bytes_to_mb(m.get("size", 0))
-        vram_mb = _bytes_to_mb(m.get("size_vram", 0))
+    for m in (ollama.ps() if rows is None else rows):
+        size_mb = _shared_bytes_to_mb(m.get("size"))
+        vram_mb = _shared_bytes_to_mb(m.get("size_vram"))
         loaded.append(
             {
                 "name": m.get("name"),
                 "size_vram_mb": vram_mb,
                 "total_size_mb": size_mb,
-                "offloaded_to_cpu": vram_mb < size_mb,
+                "offloaded_to_cpu": (vram_mb < size_mb if vram_mb is not None and size_mb is not None else None),
                 "expires_at": m.get("expires_at"),
             }
         )
@@ -49,11 +47,10 @@ def _loaded_models(ollama) -> list[dict]:
 
 
 class Snapshot:
-    """One consistent capture of the coordination signals, taken ONCE per
-    operation and shared across every model it touches (the data cannot
-    meaningfully change within a single call, so per-model re-collection
-    would only add subprocess/IO churn). All three inputs are plain data,
-    so a Snapshot is trivially fake-able in tests.
+    """One capture for a status view or an individual eviction decision.
+
+    Mutations must capture again for each candidate: another session can
+    register a claim while an earlier model is being unloaded.
 
     * ``all_claims`` — every active claim record (one ledger read).
     * ``pid_map`` — Ollama tag → runner PID (one process listing + one
@@ -82,13 +79,17 @@ class Snapshot:
         nameless ps() row must never be attributed everyone's claims)."""
         if not model_name:
             return []
+        model_name = canonical_model(model_name)
         return [c for c in self.all_claims
-                if isinstance(c, dict) and c.get("model") == model_name]
+                if isinstance(c, dict) and c.get("model")
+                and canonical_model(c["model"]) == model_name]
 
     def pid_for(self, model_name):
         if not model_name:
             return None
-        return self.pid_map.get(model_name)
+        wanted = canonical_model(model_name)
+        return next((pid for name, pid in self.pid_map.items()
+                     if canonical_model(name) == wanted), None)
 
     def busy_for(self, model_name):
         pid = self.pid_for(model_name)
@@ -159,54 +160,13 @@ def pressure(gpus: list[dict], loaded: list[dict], process_table: list[dict],
              *, runner_offloads: Optional[dict] = None,
              spill_threshold_mb: int = SPILL_THRESHOLD_MB,
              tight_mb: int = TIGHT_MB) -> dict:
-    """Classify how close the GPU is to a slow-mode, and which one.
+    """Assess one selected GPU using the available capacity and residency data.
 
-    Two degradations exist and must not be conflated:
-
-    * **Driver-forced spill** — WDDM demand-pages VRAM to system RAM under
-      pressure. This is the severe multi-x slowdown.
-    * **Deliberate CPU offload** — Ollama chose to put layers on the CPU
-      backend up front (``offloaded_to_cpu``). Slower, but a considered
-      placement, not paging.
-
-    They are NOT two independent readings, which is the trap this function was
-    originally built on. On Windows/WDDM a llama.cpp runner's deliberately
-    CPU-side layers ARE reported as that process's ``Non Local Usage``: the same
-    physical memory described twice. Believing the counter alone makes every
-    32B-on-a-24GB-card — the normal reason to offload at all — announce "the
-    driver is paging" on a perfectly quiet GPU.
-
-    So non-local memory is ATTRIBUTED rather than summed. A row is explained
-    only up to what something accounts for:
-
-    * a runner PID in ``runner_offloads`` (pid → deliberate offload MB, from
-      :func:`runner_offloads`) is explained up to that figure;
-    * a runner's non-local memory BEYOND its offload is not — that is precisely
-      "my model is being paged because another app ballooned";
-    * any other process's non-local memory is not explained at all.
-
-    Without ``runner_offloads`` (no coordination snapshot) nothing can be
-    attributed and every row counts as unexplained — the honest fallback, since
-    we cannot prove the memory is deliberate.
-
-    ``process_table`` is the FULL table including runners; the runner-filtered
-    view is a different question (see :func:`other_processes`).
-
-    Unexplained memory is then weighed rather than simply totalled. Size alone
-    never proved paging: the driver evicts only when it runs out of room, so a
-    spill is credible only when it EXCEEDS the free VRAM — had there been room,
-    the memory would still be resident. ``spill_threshold_mb`` is the floor
-    beneath which even that comparison is noise, not the whole test.
-
-    Returns ``{"state", "free_mb", "non_local_mb", "explained_offload_mb",
-    "unexplained_spill_mb", "spilling", "offloaded_models", "detail"}``.
-    ``non_local_mb`` is the raw total of the two halves and is reported for
-    transparency only — ``spilling``, ``state`` and ``detail`` all key off
-    ``unexplained_spill_mb``, which is always reported even when it is too
-    small (or too well-covered by free VRAM) to raise the alarm. ``state`` is
-    the first match of thrashing > degraded > tight > ok.
+    Non-local memory beyond known CPU offload, exceeding both the noise floor
+    and free VRAM, suggests paging. This is a heuristic, not proof of driver
+    activity. Missing capacity cannot produce a healthy verdict.
     """
-    free_mb = _gpu.max_free_mb(gpus)
+    free_mb = gpus[0].get("free_mb") if gpus else None
     entitlements = runner_offloads or {}
     explained_mb = 0
     unexplained_mb = 0
@@ -224,15 +184,7 @@ def pressure(gpus: list[dict], loaded: list[dict], process_table: list[dict],
         explained_mb += covered
         unexplained_mb += non_local - covered
     non_local_mb = explained_mb + unexplained_mb
-    # Two gates, because size alone was not evidence of paging. The driver only
-    # evicts when it runs out of room, so unexplained non-local memory is only
-    # credible as paging when it exceeds what the card still has FREE — if there
-    # were room for it, the driver would have kept it resident. Without that
-    # comparison, ~400 MB of routine allocation (staging buffers, shared
-    # surfaces) across ordinary desktop apps announced "expect severe slowdown"
-    # on a card with gigabytes free, and told the reader to free VRAM they
-    # already had. An unreadable free figure (no nvidia-smi) cannot clear the
-    # card of blame, so the floor alone decides there.
+    # Non-local allocation alone does not establish memory pressure.
     spilling = unexplained_mb >= spill_threshold_mb and (
         free_mb is None or unexplained_mb > free_mb
     )
@@ -244,8 +196,8 @@ def pressure(gpus: list[dict], loaded: list[dict], process_table: list[dict],
     if spilling:
         state = "thrashing"
         detail = (
-            f"{unexplained_mb} MB of VRAM has spilled to system RAM; the driver "
-            "is paging. Expect severe slowdown — free VRAM or reduce load."
+            f"{unexplained_mb} MB of unexplained non-local memory under VRAM "
+            "pressure suggests paging. Free VRAM or reduce load."
         )
         # Say so, or the reader assumes the whole non-local figure is paging.
         if explained_mb:
@@ -264,6 +216,9 @@ def pressure(gpus: list[dict], loaded: list[dict], process_table: list[dict],
         detail = (
             f"Only {free_mb} MB free; the next load will likely spill or fail."
         )
+    elif free_mb is None:
+        state = "unknown"
+        detail = "GPU capacity is unavailable; pressure cannot be assessed."
     else:
         state = "ok"
         detail = "No VRAM pressure detected."
@@ -285,41 +240,44 @@ def combined_status(
     snapshot_fn=None, nvml_processes_fn=None, procinfo_fn=None,
     spill_threshold_mb: int = SPILL_THRESHOLD_MB,
 ) -> dict:
-    """Snapshot of GPUs + loaded models + best free VRAM.
+    """Collect a scoped status view with explicit observation health.
 
-    Returns ``{"gpus": [...], "loaded": [...], "free_mb": int | None,
-    "pressure": {...}}``, plus ``"other_processes"`` when ``nvml_processes_fn``
-    or ``procinfo_fn`` is given. ``pressure`` is ALWAYS present: it is computed
-    from the process table when one is available (driver-spill detection needs
-    ``non_local_mb``, which only that table carries) and from the GPU + model
-    data alone otherwise — in which case it can still report ``degraded``/
-    ``tight``/``ok``, just never ``thrashing``.
-    Each loaded model always carries ``total_size_mb``/``offloaded_to_cpu``; when
-    ``snapshot_fn`` (``() -> Snapshot``) is given it also carries ``claims``
-    and ``busy``, all derived from ONE snapshot capture rather than per-model
-    re-collection. When ``procinfo_fn`` is given, other_processes entries carry
-    size_mb/name/cmdline/kind (Task 2's sized+named table); it takes precedence
-    over ``nvml_processes_fn``. Omitting the kwargs gives the plain base shape
-    (tests, ``advise``).
-
-    ``spill_threshold_mb`` forwards to ``pressure`` (VRAM_MCP_SPILL_MB at the
-    server edge).
+    GPU and process observations must describe the same device. Ollama model
+    residency remains server-wide; only correlated selected-device runners
+    contribute to the GPU pressure verdict. Each expensive source is read once.
+    Unknown sources retain metadata and return null data, never fabricated zeros.
     """
-    gpus = gpu_status_fn()
-    loaded = _loaded_models(ollama)
+    gpu_reading = gpu_status_fn()
+    if not isinstance(gpu_reading, Observation):
+        gpu_reading = Observation(gpu_reading or None, "gpu", error=None if gpu_reading else "No GPU reading")
+    gpus = gpu_reading.data if gpu_reading.known else []
+    # A status describes one device. Never borrow headroom from another GPU.
+    gpus = gpus[:1]
+    model_reading = observe_loaded(ollama)
+    loaded = _loaded_models(rows=model_reading.data) if model_reading.known else []
+    observations = {"gpu": gpu_reading.metadata(), "ollama": model_reading.metadata()}
     resolved_pids: set = set()
     offloads: dict = {}
+    snap = None
     # Nothing loaded -> nothing to enrich; skip the snapshot's subprocess/IO.
     if snapshot_fn is not None and loaded:
-        snap = snapshot_fn()
-        loaded, resolved_pids = attach_coordination(loaded, snap)
+        try:
+            snap = snapshot_fn()
+            observations["coordination"] = Observation(True, "claims+nvml").metadata()
+        except (OSError, ValueError, TimeoutError) as exc:
+            snap = None
+            observations["coordination"] = Observation(None, "claims+nvml", error=str(exc)).metadata()
+        if snap is not None:
+            loaded, resolved_pids = attach_coordination(loaded, snap)
         # The SAME snapshot answers both questions, so the pid map is walked
         # once: which PIDs are runners, and how much offload each explains.
-        offloads = runner_offloads(loaded, snap)
+            offloads = runner_offloads(loaded, snap)
     result = {
         "gpus": gpus,
-        "loaded": loaded,
-        "free_mb": _gpu.max_free_mb(gpus),
+        "loaded": loaded if model_reading.known else None,
+        "free_mb": gpus[0].get("free_mb") if gpus else None,
+        "observations": observations,
+        "scope": gpu_reading.scope,
     }
     source = procinfo_fn if procinfo_fn is not None else nvml_processes_fn
     # The source is sampled EXACTLY ONCE (a ~1 s Windows perf-counter call) and
@@ -333,11 +291,37 @@ def combined_status(
     #     already reported as model entries.
     full_table: list[dict] = []
     if source is not None:
-        full_table = source()
-        result["other_processes"] = other_processes(full_table, resolved_pids)
-    result["pressure"] = pressure(gpus, loaded, full_table,
+        process_reading = source()
+        if not isinstance(process_reading, Observation):
+            process_reading = Observation(process_reading, "processes")
+        if process_reading.scope and gpu_reading.scope and process_reading.scope != gpu_reading.scope:
+            process_reading = Observation(None, process_reading.source, error="GPU scope mismatch",
+                                          scope=process_reading.scope)
+        observations["processes"] = process_reading.metadata()
+        full_table = process_reading.data if process_reading.known else []
+        result["other_processes"] = (other_processes(full_table, resolved_pids)
+                                     if process_reading.known else None)
+    pressure_models = loaded
+    if source is not None and gpu_reading.scope:
+        selected_pids = {row["pid"] for row in full_table}
+        pressure_models = [row for row in loaded if snap is not None
+                           and snap.pid_for(row["name"]) in selected_pids]
+    result["pressure"] = pressure(gpus, pressure_models, full_table,
                                   runner_offloads=offloads,
                                   spill_threshold_mb=spill_threshold_mb)
+    non_local_known = (source is not None and process_reading.known
+                       and (process_reading.coverage or {}).get("non_local_memory", True)
+                       and all(p.get("non_local_mb") is not None for p in full_table))
+    result["pressure"]["coverage"] = {
+        "capacity": gpu_reading.known, "models": model_reading.known,
+        "processes": source is not None and process_reading.known,
+        "non_local_memory": non_local_known,
+    }
+    if not non_local_known:
+        for key in ("non_local_mb", "explained_offload_mb", "unexplained_spill_mb", "spilling"):
+            result["pressure"][key] = None
+    if result["pressure"]["state"] == "ok" and not model_reading.known:
+        result["pressure"].update(state="unknown", detail="Ollama residency is unavailable.")
     return result
 
 
@@ -377,13 +361,14 @@ def reserved_mb(all_claims: list[dict]) -> int:
             value = float(record["gb"])
         except (KeyError, TypeError, ValueError):
             continue
-        if not value > 0:
+        if not math.isfinite(value) or not value > 0:
             continue
         total += value
     return int(round(total * _MB_PER_GB))
 
 
-def can_warm(model: str, *, free_mb, reserved_mb: int, model_size_mb) -> tuple[bool, dict]:
+def can_warm(model: str, *, free_mb, reserved_mb: int, model_size_mb,
+             resident: bool = False) -> tuple[bool, dict]:
     """May ``model`` be warmed without eating VRAM another session reserved?
 
     Cooperative, not enforced: vram-mcp cannot intercept an Ollama auto-load
@@ -402,7 +387,10 @@ def can_warm(model: str, *, free_mb, reserved_mb: int, model_size_mb) -> tuple[b
     fit from an unverified one.
     """
     base = {"reserved_mb": reserved_mb, "model_size_mb": model_size_mb,
-            "free_mb": free_mb}
+            "free_mb": free_mb, "additional_mb": 0 if resident else model_size_mb}
+    if resident:
+        return True, {**base, "headroom_mb": None if free_mb is None else free_mb - reserved_mb,
+                      "reason": "already_resident"}
     if free_mb is None:
         return True, {**base, "headroom_mb": None, "reason": "free_unknown"}
 
@@ -428,35 +416,30 @@ def ensure_free(
     settle: float = 0.0,
     sleep: Callable[[float], None] = time.sleep,
     *,
-    snapshot_fn=None, force: bool = False,
+    snapshot_fn=None, force: bool = False, evict_fn=None,
 ) -> dict:
-    """Free VRAM until at least ``target_gb`` is available.
+    """Evict largest models until the selected GPU reaches the requested headroom.
 
-    Fast path: if current max free already meets the target, return without
-    unloading anything. Otherwise evict loaded models **largest ``size_vram``
-    first**, re-reading free VRAM after each eviction (sleeping ``settle``
-    seconds after each SUCCESSFUL unload, if given, to let the driver
-    actually release the memory), and stop as soon as the target is met or
-    nothing is left to unload.
-
-    Protection: when ``snapshot_fn`` (``() -> Snapshot``) is provided and
-    ``force`` is False, the coordination snapshot is captured ONCE before the
-    loop, and any model with an active claim or ``busy == True`` is skipped
-    rather than evicted, reported in ``declined`` (with claim/busy detail)
-    even if the VRAM target isn't fully reached. Protection is a no-op when
-    ``snapshot_fn`` is omitted.
-
-    Returns ``{"ok", "already_free", "free_mb", "unloaded", "declined",
-    "target_mb"}``. ``ok`` is ``False`` if the target could not be reached
-    (including when VRAM is unknown, i.e. ``free_mb is None``, so we cannot
-    prove success).
-
-    ``sleep`` is injected so tests never actually wait.
+    Recheck protection for each candidate. Production callers supply evict_fn
+    to transact the decision and verify the result through the shared operation
+    protocol. HTTP runs outside the ledger lock. Stop on unknown capacity or an
+    uncertain mutation; a blind retry could interrupt another session's work.
     """
-    target_mb = int(round(target_gb * _MB_PER_GB))
+    if isinstance(target_gb, bool) or not isinstance(target_gb, (int, float)) or not math.isfinite(target_gb) or target_gb <= 0:
+        raise ValueError("gb must be a positive finite number")
+    if not math.isfinite(target_gb * _MB_PER_GB):
+        raise ValueError("gb is too large to express as megabytes")
+    target_mb = max(1, int(round(target_gb * _MB_PER_GB)))
+    observations = {}
 
     def current_free() -> Optional[int]:
-        return _gpu.max_free_mb(gpu_status_fn())
+        reading = gpu_status_fn()
+        if isinstance(reading, Observation):
+            observations["gpu"] = reading.metadata()
+            rows = reading.data if reading.known else []
+        else:
+            rows = reading
+        return rows[0].get("free_mb") if rows else None
 
     free = current_free()
     if free is not None and free >= target_mb:
@@ -467,38 +450,55 @@ def ensure_free(
             "unloaded": [],
             "declined": [],
             "target_mb": target_mb,
+            "outcome": "succeeded", "observations": observations,
         }
+
+    if free is None:
+        return {"ok": False, "outcome": "unknown", "already_free": False,
+                "free_mb": None, "unloaded": [], "declined": [], "target_mb": target_mb,
+                "observations": observations, "detail": "No GPU capacity reading; no models evicted"}
+
+    reading = observe_loaded(ollama)
+    observations["ollama"] = reading.metadata()
+    if not reading.known:
+        return {"ok": False, "outcome": "unknown", "already_free": False,
+                "free_mb": free, "unloaded": [], "declined": [], "target_mb": target_mb,
+                "observations": observations, "detail": "Ollama residency unavailable; no models evicted"}
 
     # Largest-first so we free the most VRAM with the fewest evictions.
     models = sorted(
-        _loaded_models(ollama),
-        key=lambda m: m["size_vram_mb"],
+        _loaded_models(rows=reading.data),
+        key=lambda m: m["size_vram_mb"] or 0,
         reverse=True,
     )
 
-    # ONE snapshot for the whole eviction pass (protection data cannot
-    # meaningfully change mid-call), and none at all when there are no
-    # candidate models to protect.
-    snap = (snapshot_fn()
-            if (snapshot_fn is not None and not force and models) else None)
-
     unloaded: list[str] = []
     declined: list[dict] = []
+    attempts: list[dict] = []
     for m in models:
         name = m["name"]
         if not name:
             continue
-        if snap is not None:
-            protected, detail = is_protected(name, snap)
+        if snapshot_fn is not None and not force and evict_fn is None:
+            protected, detail = is_protected(name, snapshot_fn())
             if protected:
                 declined.append({"name": name, **detail})
                 continue
-        if ollama.unload(name):
+        if evict_fn is not None:
+            outcome = evict_fn(name)
+        else:
+            ok = ollama.unload(name)
+            outcome = {"model": name, "ok": ok, "outcome": "succeeded" if ok else "failed"}
+        attempts.append(outcome)
+        if outcome["outcome"] == "refused":
+            declined.append({"name": name, **outcome})
+            continue
+        if outcome["ok"]:
             unloaded.append(name)
             if settle:
                 sleep(settle)
         free = current_free()
-        if free is not None and free >= target_mb:
+        if free is None or outcome["outcome"] == "unknown" or free >= target_mb:
             break
 
     ok = free is not None and free >= target_mb
@@ -509,6 +509,9 @@ def ensure_free(
         "unloaded": unloaded,
         "declined": declined,
         "target_mb": target_mb,
+        "outcome": ("succeeded" if ok else "unknown" if free is None or any(
+            a["outcome"] == "unknown" for a in attempts) else "refused" if declined else "failed"),
+        "attempts": attempts, "observations": observations,
     }
 
 
@@ -536,7 +539,7 @@ def advise(gpu_status_fn: Callable[[], list[dict]], ollama) -> dict:
     Returns ``{"suggestions": [str, ...]}``. Empty list means nothing to flag.
     """
     status = combined_status(gpu_status_fn, ollama)
-    loaded = status["loaded"]
+    loaded = status["loaded"] or []
     free_mb = status["free_mb"]
 
     suggestions: list[str] = []
@@ -558,4 +561,6 @@ def advise(gpu_status_fn: Callable[[], list[dict]], ollama) -> dict:
             "OLLAMA_KEEP_ALIVE (e.g. 5m) so idle models release VRAM."
         )
 
-    return {"suggestions": suggestions}
+    return {"suggestions": suggestions, "observations": status["observations"],
+            "known": status["observations"]["gpu"]["status"] == "available"
+            and status["observations"]["ollama"]["status"] == "available"}

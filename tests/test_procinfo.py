@@ -1,42 +1,49 @@
 """Tests for vram_mcp.procinfo — pure, injected readers."""
 from vram_mcp import procinfo
+from vram_mcp.observations import Observation
 
 
 def test_process_table_uses_nvml_sizes_when_present():
     # Linux/TCC: NVML gives real sizes; names come from the posix reader.
     nvml = lambda: [{"pid": 100, "size_mb": 8000, "kind": "compute"}]
     names = lambda pids: {100: {"name": "python", "cmdline": "python train.py"}}
-    out = procinfo.process_table(nvml_processes=nvml, posix_name_reader=names)
+    out = procinfo.process_table(
+        nvml_processes=nvml, posix_name_reader=names, platform="linux",
+    )
     assert out == [{"pid": 100, "size_mb": 8000, "shared_mb": None,
                     "non_local_mb": None, "name": "python",
                     "cmdline": "python train.py", "kind": "compute"}]
 
 
-def test_process_table_windows_fallback_fills_null_sizes_and_names():
-    # WDDM: NVML sizes are null; the win reader supplies size+name+cmdline.
+def test_process_table_windows_counters_only_fill_identity():
+    # WDDM counters aggregate adapters, so they cannot size one selected GPU.
     nvml = lambda: [{"pid": 100, "size_mb": None, "kind": "compute"},
                     {"pid": 200, "size_mb": None, "kind": "graphics"}]
     win = lambda: [{"pid": 100, "size_mb": 14492, "name": "python.exe",
                     "cmdline": "python.exe train_lora_kg.py"}]
-    out = procinfo.process_table(nvml_processes=nvml, win_gpu_reader=win)
+    out = procinfo.process_table(
+        nvml_processes=nvml, win_gpu_reader=win, platform="win32",
+    )
     by_pid = {p["pid"]: p for p in out}
-    assert by_pid[100]["size_mb"] == 14492
+    assert by_pid[100]["size_mb"] is None
+    assert by_pid[100]["shared_mb"] is None
+    assert by_pid[100]["non_local_mb"] is None
     assert by_pid[100]["name"] == "python.exe"
     assert by_pid[100]["kind"] == "compute"          # kind preserved from NVML
     assert by_pid[200]["size_mb"] is None             # win reader didn't see it -> stays null
     assert by_pid[200]["name"] is None
 
 
-def test_process_table_windows_reader_adds_pid_nvml_missed():
-    # The perf counter can see a GPU-memory holder NVML's v3 call didn't list.
+def test_process_table_windows_reader_does_not_add_unattributed_pid():
+    # A counter-only PID cannot be attributed to the selected adapter.
     nvml = lambda: []
     win = lambda: [{"pid": 300, "size_mb": 2048, "shared_mb": 0,
                     "non_local_mb": 0, "name": "UnrealEditor.exe",
                     "cmdline": "UnrealEditor.exe Project.uproject"}]
-    out = procinfo.process_table(nvml_processes=nvml, win_gpu_reader=win)
-    assert out == [{"pid": 300, "size_mb": 2048, "shared_mb": 0,
-                    "non_local_mb": 0, "name": "UnrealEditor.exe",
-                    "cmdline": "UnrealEditor.exe Project.uproject", "kind": "compute"}]
+    out = procinfo.process_table(
+        nvml_processes=nvml, win_gpu_reader=win, platform="win32",
+    )
+    assert out == []
 
 
 def test_process_table_no_readers_returns_nvml_only_unnamed():
@@ -47,18 +54,19 @@ def test_process_table_no_readers_returns_nvml_only_unnamed():
                     "cmdline": None, "kind": "compute"}]
 
 
-def test_process_table_merges_spill_fields():
-    # Non Local usage = driver spilled VRAM into system RAM; must survive the merge.
+def test_process_table_does_not_assign_adapter_aggregated_spill_fields():
     rows = procinfo.process_table(
         nvml_processes=lambda: [{"pid": 7, "size_mb": None, "kind": "compute"}],
         win_gpu_reader=lambda: [
             {"pid": 7, "size_mb": 500, "shared_mb": 12, "non_local_mb": 300,
              "name": "a.exe", "cmdline": "a"},
         ],
+        platform="win32",
     )
-    assert rows[0]["non_local_mb"] == 300
-    assert rows[0]["shared_mb"] == 12
-    assert rows[0]["size_mb"] == 500
+    assert rows[0]["non_local_mb"] is None
+    assert rows[0]["shared_mb"] is None
+    assert rows[0]["size_mb"] is None
+    assert rows[0]["name"] == "a.exe"
 
 
 def test_process_table_defaults_spill_fields_to_none():
@@ -68,6 +76,66 @@ def test_process_table_defaults_spill_fields_to_none():
     )
     assert rows[0]["shared_mb"] is None
     assert rows[0]["non_local_mb"] is None
+
+
+def test_process_table_dispatches_reader_for_actual_platform():
+    calls = {"windows": 0, "posix": 0}
+
+    def windows():
+        calls["windows"] += 1
+        return [{"pid": 7, "name": "win.exe", "cmdline": "win"}]
+
+    def posix(pids):
+        calls["posix"] += 1
+        return {7: {"name": "python", "cmdline": "python train.py"}}
+
+    rows = procinfo.process_table(
+        nvml_processes=lambda: [{"pid": 7, "size_mb": 100}],
+        win_gpu_reader=windows, posix_name_reader=posix, platform="linux",
+    )
+    assert calls == {"windows": 0, "posix": 1}
+    assert rows[0]["name"] == "python"
+
+
+def test_observe_processes_preserves_failed_vs_empty_and_scope():
+    def failed(index, *, nvml=None):
+        return Observation(None, "nvml", error="driver unavailable",
+                           scope=f"gpu:index={index}")
+
+    def empty(index, *, nvml=None):
+        return Observation([], "nvml", scope=f"gpu:index={index}")
+
+    unavailable = procinfo.observe_processes(
+        1, platform="linux", nvml_observer=failed,
+        posix_reader=lambda pids: {},
+    )
+    available = procinfo.observe_processes(
+        1, platform="linux", nvml_observer=empty,
+        posix_reader=lambda pids: {},
+    )
+    assert unavailable.known is False
+    assert unavailable.data is None
+    assert available.known is True
+    assert available.data == []
+    assert available.scope == "gpu:index=1"
+    assert available.metadata()["coverage"] == {"non_local_memory": False}
+
+
+def test_observe_processes_propagates_nvml_query_coverage():
+    def partial(index, *, nvml=None):
+        return Observation(
+            [], "nvml", scope=f"gpu:index={index}",
+            coverage={"compute_processes": True, "graphics_processes": False},
+        )
+
+    result = procinfo.observe_processes(
+        platform="linux", nvml_observer=partial, posix_reader=lambda pids: {},
+    )
+    assert result.coverage == {
+        "compute_processes": True,
+        "graphics_processes": False,
+        "non_local_memory": False,
+    }
 
 
 def test_win_gpu_procs_parses_pipe_lines(monkeypatch):

@@ -1,8 +1,71 @@
 """Tests for vram_mcp.ollama — pure, mocked session, no real Ollama."""
 
 import requests
+import pytest
 
 from vram_mcp.ollama import OllamaClient
+
+
+@pytest.mark.parametrize("payload", [{}, {"models": None}, {"models": [None]}, {"models": [{"name": " "}]}])
+def test_invalid_observation_is_unknown_not_empty(payload):
+    client = OllamaClient(session=FakeSession(get_response=FakeResponse(200, payload)))
+    reading = client.observe_loaded()
+    assert reading.data is None and not reading.known
+
+
+def test_successful_empty_observation_is_known():
+    client = OllamaClient(session=FakeSession(get_response=FakeResponse(200, {"models": []})))
+    assert client.observe_loaded().known
+
+
+def test_unload_timeout_reconciles_without_repeating_post():
+    session = FakeSession(get_response=FakeResponse(200, {"models": []}), raise_on="post")
+    result = OllamaClient(session=session).change_residency("llama3", 0, resident=False, sleep=lambda _: None)
+    assert result["outcome"] == "succeeded"
+    assert result["model"] == "llama3:latest"
+    assert len(session.post_calls) == 1
+
+
+def test_warm_timeout_does_not_claim_keep_alive_was_applied():
+    session = FakeSession(get_response=FakeResponse(200, {"models": [{"name": "llama3:latest"}]}),
+                          raise_on="post")
+    result = OllamaClient(session=session).change_residency("llama3", "5m", resident=True, sleep=lambda _: None)
+    assert result["outcome"] == "unknown"
+    assert result["resident"] is True
+    assert len(session.post_calls) == 1
+    assert len(session.get_calls) == 3
+
+
+def test_acknowledgement_requires_residency_verification():
+    session = FakeSession(get_response=FakeResponse(200, {"models": []}), post_response=FakeResponse())
+    result = OllamaClient(session=session).change_residency("llama3", "5m", resident=True, sleep=lambda _: None)
+    assert result["outcome"] == "unknown"
+    assert result["ok"] is False
+
+
+def test_backend_rejection_is_definite_failure():
+    session = FakeSession(post_response=FakeResponse(404))
+    result = OllamaClient(session=session).change_residency("missing", "5m", resident=True)
+    assert result["outcome"] == "failed"
+    assert session.get_calls == []
+
+
+def test_verified_warm_canonicalizes_alias_and_encodes_indefinite_duration():
+    session = FakeSession(
+        get_response=FakeResponse(200, {"models": [{"name": "Library/LLAMA3"}]}),
+        post_response=FakeResponse(200, {"done": True}))
+    result = OllamaClient(session=session).change_residency("llama3", "-1", resident=True)
+    assert result["outcome"] == "succeeded"
+    assert result["resident"] is True
+    assert session.post_calls[0]["json"]["keep_alive"] == -1
+
+
+def test_invalid_acknowledgement_cannot_verify_keep_alive():
+    session = FakeSession(
+        get_response=FakeResponse(200, {"models": [{"name": "llama3:latest"}]}),
+        post_response=FakeResponse(200, {"error": "bad request"}))
+    result = OllamaClient(session=session).change_residency("llama3", "5m", resident=True, sleep=lambda _: None)
+    assert result["outcome"] == "unknown"
 
 
 class FakeResponse:

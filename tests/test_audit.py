@@ -26,6 +26,7 @@ def test_log_action_writes_typed_event(tmp_path):
     e = events[0]
     assert e["type"] == "action" and e["action"] == "unload"
     assert e["target"] == "qwen3:8b" and e["actor"] == "retro-repo"
+    assert e["outcome"] == "succeeded"  # legacy input is normalized on write
     assert e["force"] is True and e["ts"] == "2026-07-16T18:00:00Z"
 
 
@@ -37,7 +38,7 @@ def test_read_events_newest_first_and_limit(tmp_path):
                          now_fn=clk, path=p)
         clk.tick(1)
     got = audit.read_events(limit=2, path=p)
-    assert [e["target"] for e in got] == ["c", "b"]
+    assert [e["target"] for e in got] == ["c:latest", "b:latest"]
 
 
 def test_read_events_filter_by_model_and_type(tmp_path):
@@ -49,6 +50,17 @@ def test_read_events_filter_by_model_and_type(tmp_path):
     assert [e["action"] for e in audit.read_events(type="action", path=p)]  # all are actions
 
 
+def test_read_events_model_filter_matches_legacy_bare_ollama_name(tmp_path):
+    p = tmp_path / "events.jsonl"
+    p.write_text(
+        '{"ts":"2026-07-16T18:00:00Z","type":"action","kind":"ollama",'
+        '"target":"llama3.2","action":"unload","outcome":"ok"}\n',
+        encoding="utf-8",
+    )
+    got = audit.read_events(model="llama3.2:latest", path=p)
+    assert [event["target"] for event in got] == ["llama3.2"]
+
+
 def test_read_events_since_floor(tmp_path):
     p = tmp_path / "events.jsonl"
     clk = _clock()
@@ -56,7 +68,7 @@ def test_read_events_since_floor(tmp_path):
     clk.tick(120)
     audit.log_action(action="warm", target="new", kind="ollama", now_fn=clk, path=p)
     got = audit.read_events(since="2026-07-16T18:01:00Z", path=p)
-    assert [e["target"] for e in got] == ["new"]
+    assert [e["target"] for e in got] == ["new:latest"]
 
 
 def test_log_action_respects_cap(tmp_path):
@@ -66,7 +78,7 @@ def test_log_action_respects_cap(tmp_path):
         audit.log_action(action="warm", target=str(i), kind="ollama",
                          now_fn=clk, path=p, cap=5)
     targets = [e["target"] for e in audit.read_events(limit=99, path=p)]
-    assert targets == ["7", "6", "5", "4", "3"]  # newest-first, last 5
+    assert targets == ["7:latest", "6:latest", "5:latest", "4:latest", "3:latest"]
 
 
 def _holder(key, target, kind, size_mb=None):
@@ -135,7 +147,7 @@ def test_detect_appearance_logged(tmp_path):
     audit.detect_and_log([], last_seen_path=ls, log_path=log, now_fn=clk)  # empty baseline
     m = [_holder("ollama:llama3.2", "llama3.2", "ollama")]
     emitted = audit.detect_and_log(m, last_seen_path=ls, log_path=log, now_fn=clk)
-    assert emitted[0]["type"] == "appeared" and emitted[0]["target"] == "llama3.2"
+    assert emitted[0]["type"] == "appeared" and emitted[0]["target"] == "llama3.2:latest"
 
 
 def test_detect_corrupt_baseline_treated_as_first_run_no_storm(tmp_path):
@@ -159,7 +171,7 @@ def test_detect_valid_empty_baseline_still_fires_appeared(tmp_path):
     m = [_holder("ollama:llama3.2", "llama3.2", "ollama")]
     emitted = audit.detect_and_log(m, last_seen_path=ls, log_path=log, now_fn=clk)
     assert len(emitted) == 1
-    assert emitted[0]["type"] == "appeared" and emitted[0]["target"] == "llama3.2"
+    assert emitted[0]["type"] == "appeared" and emitted[0]["target"] == "llama3.2:latest"
 
 
 def test_detect_second_session_does_not_double_log(tmp_path):
@@ -171,6 +183,153 @@ def test_detect_second_session_does_not_double_log(tmp_path):
     audit.detect_and_log([], last_seen_path=ls, log_path=log, now_fn=clk)  # session A logs it
     again = audit.detect_and_log([], last_seen_path=ls, log_path=log, now_fn=clk)  # session B
     assert again == []  # already gone from last_seen -> nothing to re-log
+
+
+def test_unsuccessful_actions_never_claim_a_disappearance(tmp_path):
+    for outcome in ("refused", "failed", "unknown"):
+        case = tmp_path / outcome
+        ls, log = case / "last_seen.json", case / "events.jsonl"
+        clk = _clock()
+        holder = [_holder("ollama:llama3.2", "llama3.2", "ollama")]
+        audit.detect_and_log(holder, last_seen_path=ls, log_path=log, now_fn=clk)
+        clk.tick(2)
+        audit.log_action(action="unload", target="llama3.2", kind="ollama",
+                         outcome=outcome, now_fn=clk, path=log)
+        clk.tick(1)
+        [event] = audit.detect_and_log(
+            [], last_seen_path=ls, log_path=log, now_fn=clk,
+            observed_kinds={"ollama"},
+        )
+        assert event["cause"] == "external"
+
+
+def test_unavailable_and_partial_reads_preserve_last_good_baseline(tmp_path):
+    ls, log = tmp_path / "last_seen.json", tmp_path / "events.jsonl"
+    clk = _clock()
+    holders = [
+        _holder("ollama:qwen3:8b", "qwen3:8b", "ollama"),
+        _holder("process:100", "python train.py", "process", 12000),
+    ]
+    audit.detect_and_log(holders, last_seen_path=ls, log_path=log, now_fn=clk)
+
+    clk.tick(10)
+    assert audit.detect_and_log(
+        None, last_seen_path=ls, log_path=log, now_fn=clk,
+        observed_kinds={"ollama"},
+    ) == []
+    # Ollama succeeded with an empty result; process telemetry was unavailable.
+    [ollama_gone] = audit.detect_and_log(
+        [], last_seen_path=ls, log_path=log, now_fn=clk,
+        observed_kinds={"ollama"},
+    )
+    assert ollama_gone["kind"] == "ollama"
+
+    clk.tick(10)
+    assert audit.detect_and_log(
+        [holders[1]], last_seen_path=ls, log_path=log, now_fn=clk,
+        observed_kinds={"process"},
+    ) == []
+    [process_gone] = audit.detect_and_log(
+        [], last_seen_path=ls, log_path=log, now_fn=clk,
+        observed_kinds={"process"},
+    )
+    assert process_gone["kind"] == "process"
+
+
+def test_stale_source_timestamp_cannot_regress_baseline(tmp_path):
+    ls, log = tmp_path / "last_seen.json", tmp_path / "events.jsonl"
+    old = [_holder("ollama:old", "old", "ollama")]
+    new = [_holder("ollama:new", "new", "ollama")]
+    audit.detect_and_log(
+        old, last_seen_path=ls, log_path=log, now_fn=lambda: _T0,
+        observed_at=_T0, observed_kinds={"ollama"}, scope="ollama:local",
+    )
+    t20 = _T0 + timedelta(seconds=20)
+    audit.detect_and_log(
+        new, last_seen_path=ls, log_path=log, now_fn=lambda: t20,
+        observed_at=t20, observed_kinds={"ollama"}, scope="ollama:local",
+    )
+
+    stale = audit.detect_and_log(
+        [], last_seen_path=ls, log_path=log, now_fn=lambda: t20,
+        observed_at=_T0 + timedelta(seconds=10), observed_kinds={"ollama"},
+        scope="ollama:local",
+    )
+    assert stale == []
+    assert audit.detect_and_log(
+        new, last_seen_path=ls, log_path=log,
+        now_fn=lambda: _T0 + timedelta(seconds=30),
+        observed_at=_T0 + timedelta(seconds=30), observed_kinds={"ollama"},
+        scope="ollama:local",
+    ) == []
+
+
+def test_scoped_baselines_do_not_cross_contaminate(tmp_path):
+    ls, log = tmp_path / "last_seen.json", tmp_path / "events.jsonl"
+    clk = _clock()
+    holder = [_holder("ollama:qwen3:8b", "qwen3:8b", "ollama")]
+    audit.detect_and_log(holder, last_seen_path=ls, log_path=log, now_fn=clk,
+                         observed_kinds={"ollama"}, scope="ollama:a")
+    audit.detect_and_log([], last_seen_path=ls, log_path=log, now_fn=clk,
+                         observed_kinds={"ollama"}, scope="ollama:b")
+    clk.tick(20)
+    [gone] = audit.detect_and_log(
+        [], last_seen_path=ls, log_path=log, now_fn=clk,
+        observed_kinds={"ollama"}, scope="ollama:a",
+    )
+    assert gone["scope"] == "ollama:a"
+    assert audit.detect_and_log(
+        [], last_seen_path=ls, log_path=log, now_fn=clk,
+        observed_kinds={"ollama"}, scope="ollama:b",
+    ) == []
+
+
+def test_action_from_another_scope_cannot_claim_disappearance(tmp_path):
+    ls, log = tmp_path / "last_seen.json", tmp_path / "events.jsonl"
+    clk = _clock()
+    holder = [_holder("ollama:qwen3:8b", "qwen3:8b", "ollama")]
+    audit.detect_and_log(holder, last_seen_path=ls, log_path=log, now_fn=clk,
+                         observed_kinds={"ollama"}, scope="http://ollama-a")
+    clk.tick(2)
+    audit.log_action(action="unload", target="qwen3:8b", kind="ollama",
+                     outcome="succeeded", scope="http://ollama-b",
+                     now_fn=clk, path=log)
+    clk.tick(1)
+    [event] = audit.detect_and_log(
+        [], last_seen_path=ls, log_path=log, now_fn=clk,
+        observed_kinds={"ollama"}, scope="http://ollama-a",
+    )
+    assert event["cause"] == "external"
+
+
+def test_legacy_ok_action_attributes_canonical_bare_name(tmp_path):
+    ls, log = tmp_path / "last_seen.json", tmp_path / "events.jsonl"
+    clk = _clock()
+    holder = [_holder("ollama:llama3.2", "llama3.2", "ollama")]
+    audit.detect_and_log(holder, last_seen_path=ls, log_path=log, now_fn=clk)
+    clk.tick(2)
+    log.write_text(
+        '{"ts":"2026-07-16T18:00:02Z","type":"action","kind":"ollama",'
+        '"target":"llama3.2","action":"unload","actor":"legacy","outcome":"ok"}\n',
+        encoding="utf-8",
+    )
+    clk.tick(1)
+    [event] = audit.detect_and_log([], last_seen_path=ls, log_path=log, now_fn=clk)
+    assert event["target"] == "llama3.2:latest"
+    assert event["cause"] == "self_action" and event["actor"] == "legacy"
+
+
+def test_future_successful_action_is_not_used_for_attribution(tmp_path):
+    ls, log = tmp_path / "last_seen.json", tmp_path / "events.jsonl"
+    clk = _clock()
+    holder = [_holder("ollama:qwen3:8b", "qwen3:8b", "ollama")]
+    audit.detect_and_log(holder, last_seen_path=ls, log_path=log, now_fn=clk)
+    future = _T0 + timedelta(seconds=30)
+    audit.log_action(action="unload", target="qwen3:8b", kind="ollama",
+                     outcome="succeeded", now_fn=lambda: future, path=log)
+    clk.tick(1)
+    [event] = audit.detect_and_log([], last_seen_path=ls, log_path=log, now_fn=clk)
+    assert event["cause"] == "external"
 
 
 def _sample(free_mb=1000, state="ok"):
@@ -210,6 +369,25 @@ def test_sample_written_after_interval(tmp_path):
         _sample(free_mb=200), state_path=state, log_path=log,
         now_fn=lambda: t1, interval_seconds=60) is True
     assert len(audit.read_events(type="sample", path=log)) == 2
+
+
+def test_sample_throttle_and_history_are_scoped(tmp_path):
+    log, state = tmp_path / "e.jsonl", tmp_path / "s.json"
+    now = datetime(2026, 7, 19, 12, 0, 0, tzinfo=timezone.utc)
+    assert audit.maybe_log_sample(
+        _sample(), state_path=state, log_path=log, now_fn=lambda: now,
+        scope="gpu:0",
+    ) is True
+    assert audit.maybe_log_sample(
+        _sample(), state_path=state, log_path=log, now_fn=lambda: now,
+        scope="gpu:1",
+    ) is True
+    assert audit.maybe_log_sample(
+        _sample(), state_path=state, log_path=log, now_fn=lambda: now,
+        scope="gpu:0",
+    ) is False
+    assert len(audit.read_events(type="sample", scope="gpu:0", path=log)) == 1
+    assert len(audit.read_events(type="sample", scope="gpu:1", path=log)) == 1
 
 
 def test_corrupt_state_file_treated_as_never_sampled(tmp_path):

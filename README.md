@@ -6,8 +6,9 @@ make room for [Ollama](https://ollama.com) models, and see which sessions are
 already relying on them.
 
 Each client runs its own server; sessions under the same OS user share claims,
-reservations, and an audit log. Claimed or recently busy models are protected
-from eviction by default.
+reservations, pending-operation records, and an audit log. Capacity and process
+readings apply to one configured GPU. Claimed or recently busy models are
+protected from eviction by default.
 
 ## Get started
 
@@ -18,7 +19,8 @@ are unavailable.
 
 Run vram-mcp on the machine hosting Ollama and the GPU. Changing
 `OLLAMA_BASE_URL` redirects model requests; GPU and process inspection always
-remain local.
+remain local. On a multi-GPU host, set `VRAM_MCP_GPU_INDEX` in every client's
+server environment to select the same device; the default is GPU index `0`.
 
 ### Connect your client
 
@@ -80,9 +82,11 @@ Ask your agent:
 > much room is left. Report any unavailable readings.
 
 The agent should call `vram_status()` and `list_claims()`. Status includes a
-readable `summary`, per-GPU readings, loaded models, and available process
-details. `list_claims()` also shows capacity reserved for training or other
-non-Ollama work.
+readable `summary`, the selected GPU, loaded models, available process details,
+and `observations` metadata. Check each observation's `status`; `unavailable`
+means the corresponding value is unknown, rather than empty or zero.
+`list_claims()` also shows capacity reserved for training or other non-Ollama
+work.
 
 ## Agent workflow
 
@@ -91,7 +95,9 @@ commands or a Python API. Use a descriptive session label for `owner` and `by`,
 such as `codex:review`, so another agent can identify your work.
 
 1. **Inspect before changing memory.** Call `vram_status()` and `list_claims()`.
-   Use exact model names, including tags, from Ollama; claim matching is exact.
+   Model names are canonicalized consistently: a bare final name such as
+   `llama3` becomes `llama3:latest`; comparison is case-insensitive, and
+   Ollama's default registry/library prefix is removed.
 2. **Claim a model before relying on it.** Replace the example model below
    with one already installed in Ollama. Continue only if the claim succeeds,
    and save its returned `claim_id`.
@@ -102,13 +108,20 @@ such as `codex:review`, so another agent can identify your work.
 
 3. **Make room when needed.** `ensure_free(gb=8, by="codex:review")` unloads
    unprotected models largest-first. Choose the target for your workload and
-   check `ok`, `free_mb`, `declined`, and `reserved_mb`. Reaching the target
-   does not give you ownership of that space.
+   check `outcome`, `free_mb`, `declined`, `reserved_mb`, and `observations`.
+   It does not evict when selected-GPU capacity or Ollama residency is unknown.
+   Reaching the target does not give you ownership of that space.
 4. **Load and check.** Call
    `warm(model="llama3:latest", keep_alive="10m", by="codex:review")` when needed.
-   Inspect `ok` and `reason`, then check `vram_status()` again. Loading
-   successfully does not guarantee full GPU residency. Run inference through
-   your usual Ollama client.
+   Inspect `outcome`, `reason`, and `observations`. `succeeded` means residency
+   was reconciled after the request; `refused` means no Ollama request was sent;
+   `failed` means Ollama definitively rejected it; and `unknown` means the
+   request may still be running and includes `pending_until`. Do not retry a
+   same-model mutation until that pending window ends. Warm admission is also
+   serialized across models sharing the selected GPU. A model that was already
+   resident has zero incremental residency cost (`reason="already_resident"`).
+   Loading successfully does not guarantee full GPU residency. Run inference
+   through your usual Ollama client.
 5. **Renew and release.** Claims expire after one hour by default. Call
    `renew(claim_id="<returned claim_id>")` before expiry for longer work and
    `release(claim_id="<returned claim_id>")` when finished, including if loading
@@ -119,24 +132,34 @@ For training or diffusion, use `reserve(gb=8, owner="codex:training",
 purpose="LoRA training")` to declare capacity, then renew/release its `claim_id`
 in the same way. A reservation records intent; it does not allocate memory.
 
+Validation rejects invalid requests: capacities, TTLs, and trend windows
+must be finite and positive; model, owner, purpose, and caller labels must be
+nonblank; `warm` accepts a positive Ollama duration or `-1` for indefinite
+residency. Use `unload()` rather than a zero `keep_alive`.
+
 **Coordination is cooperative.** Direct Ollama calls can bypass it. `force=True`
-on `unload`, `ensure_free`, or `warm` overrides protection; use it only after
-resolving the competing work. `busy=null` means unknown and does not block
-eviction on its own. If `free_mb` is unknown, `ensure_free` can still unload
-models but cannot verify success. See [coordination details](docs/coordination.md).
+on `unload`, `ensure_free`, or `warm` overrides claims, busy protection, or
+reservation admission; use it only after resolving competing work. It does not
+bypass an unreadable coordination ledger or another pending mutation.
+`busy=null` means unknown and does not block eviction on its own. See
+[coordination details](docs/coordination.md).
 
 ## Understand the readings
 
 | `pressure.state` | Meaning |
 | --- | --- |
 | `ok` | No pressure detected in the available readings. |
-| `tight` | Less than 1 GiB is free on the GPU with the most room. |
+| `tight` | Less than 1 GiB is free on the selected GPU. |
 | `degraded` | Ollama placed part of a model on the CPU; expect slower inference. |
 | `thrashing` | Unexplained non-local memory meets the spill threshold and, when free VRAM is known, exceeds it. Driver paging is suspected. |
 
-Missing telemetry limits these conclusions: `ok` with `free_mb=null` does not
-prove there is room for another model. Driver-spill detection needs Windows
-performance counters and auditing enabled. CPU offload is tracked separately.
+Missing required telemetry produces `pressure.state="unknown"`. Read
+`pressure.coverage` and top-level `observations` to see which evidence was
+available. Driver-spill detection is best effort and requires non-local memory
+that can be attributed to the selected GPU; adapter-aggregated Windows counters
+do not establish that. CPU offload is tracked separately. Disabling auditing
+stops history detection and trend sampling, but does not disable current GPU or
+process observations.
 
 Use `history()` to investigate a model disappearing and `trend(hours=1)` to
 review memory changes. Trends are sampled when `vram_status()` reads the GPU;

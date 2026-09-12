@@ -10,6 +10,21 @@ import pytest
 pytest.importorskip("mcp")
 
 from vram_mcp import core, server  # noqa: E402
+from vram_mcp.observations import Observation
+
+
+@pytest.fixture(autouse=True)
+def isolated_runtime(monkeypatch, tmp_path):
+    import requests
+    monkeypatch.setattr(server._claims, "_DEFAULT_PATH", tmp_path / "claims.json")
+    monkeypatch.setattr(server._audit, "log_action", lambda **kwargs: None)
+    def forbidden(*args, **kwargs):
+        raise AssertionError("Tests must inject network and GPU collectors")
+    monkeypatch.setattr(requests.Session, "request", forbidden)
+    monkeypatch.setattr(server, "_gpu_reading", forbidden)
+    monkeypatch.setattr(server, "_procinfo_table", forbidden)
+    monkeypatch.setattr(server, "_snapshot", forbidden)
+
 
 
 @pytest.fixture
@@ -34,6 +49,7 @@ def _status(gpus, loaded=(), procs=()):
     return {
         "gpus": list(gpus), "loaded": list(loaded),
         "other_processes": list(procs),
+        "observations": {"ollama": Observation(list(loaded), "ollama", scope="ollama").metadata()},
         "pressure": {"free_mb": None if not gpus else 500,
                      "non_local_mb": 0, "state": "ok"},
     }
@@ -117,10 +133,11 @@ def warm_env(monkeypatch):
     """A GPU with 20 GB free and one 8 GB reservation held by another session."""
     monkeypatch.setattr(server._audit, "log_action", lambda **kwargs: None)
     monkeypatch.setattr(core, "combined_status", lambda *a, **k: {
-        "gpus": [], "loaded": [], "free_mb": 20000, "pressure": {}})
+        "gpus": [], "loaded": [], "free_mb": 20000, "pressure": {}, "observations": {}})
     monkeypatch.setattr(server, "_active_claims", lambda: (
         [{"kind": "reservation", "gb": 8, "owner": "trainer", "purpose": "sd"}], True))
-    monkeypatch.setattr(server._ollama, "warm", lambda model, keep_alive: True)
+    monkeypatch.setattr(server._ollama, "change_residency", lambda model, keep_alive, **kwargs: {
+        "ok": True, "outcome": "succeeded", "detail": "Residency verified"})
     return monkeypatch
 
 
@@ -129,16 +146,16 @@ def test_warm_allowed_with_unverifiable_size_says_the_check_was_unverified(warm_
     model 'size unknown' and admission control degrades wholesale to allow. That
     is the deliberate fail-open policy — but a 20 GB model must not sail through
     an 8 GB reservation reporting a plain success."""
-    warm_env.setattr(server._ollama, "tags", lambda: {})
+    warm_env.setattr(server._ollama, "observe_tags", lambda: Observation({}, "sizes"))
     result = server._warm_impl("qwen3:32b", "5m", "tester", False)
     assert result["ok"] is True
     assert result["reason"] == "size_unknown"
     assert result["size_verified"] is False
-    assert "size" in result["summary"] and "8192 MB" in result["summary"]
+    assert "size_unknown" in result["summary"] and "8192 MB" in result["summary"]
 
 
 def test_warm_allowed_with_a_verified_size_is_distinguishable(warm_env):
-    warm_env.setattr(server._ollama, "tags", lambda: {"qwen3:32b": 1900})
+    warm_env.setattr(server._ollama, "observe_tags", lambda: Observation({"qwen3:32b": 1900}, "sizes"))
     result = server._warm_impl("qwen3:32b", "5m", "tester", False)
     assert result["ok"] is True
     assert result["reason"] == "fits"
@@ -149,11 +166,41 @@ def test_warm_allowed_with_a_verified_size_is_distinguishable(warm_env):
 def test_warm_forced_reports_no_admission_verdict(warm_env):
     """force=True skips the check entirely; claiming a size was verified (or
     wasn't) would describe a check that never ran."""
-    warm_env.setattr(server._ollama, "tags", lambda: {})
+    warm_env.setattr(server._ollama, "observe_tags", lambda: Observation({}, "sizes"))
     result = server._warm_impl("qwen3:32b", "5m", "tester", True)
     assert result["ok"] is True
     assert "size_verified" not in result
     assert "reason" not in result
+
+
+def test_warm_resident_refresh_requires_no_additional_capacity(warm_env):
+    warm_env.setattr(core, "combined_status", lambda *a, **k: {
+        "loaded": [{"name": "llama3:latest", "size_vram_mb": 8192}],
+        "free_mb": 2048, "observations": {}})
+    warm_env.setattr(server, "_active_claims", lambda: ([{"kind": "reservation", "gb": 1}], True))
+    result = server._warm_impl("llama3", "5m", "tester", False)
+    assert result["ok"] is True
+    assert result["model"] == "llama3:latest"
+    assert result["additional_mb"] == 0
+    assert result["reason"] == "already_resident"
+
+
+def test_warm_unknown_ledger_does_not_become_zero_reservations(warm_env):
+    warm_env.setattr(server, "_active_claims", lambda: ([], False))
+    result = server._warm_impl("llama3", "5m", "tester", False)
+    assert result["outcome"] == "refused"
+    assert result["reason"] == "observation_unavailable"
+
+
+@pytest.mark.parametrize("keep_alive", ["0", "0s", "", "nonsense", "0m0s", "-5m"])
+def test_warm_cannot_bypass_unload_protection_with_zero_duration(keep_alive):
+    result = server._warm_impl("llama3", keep_alive, "tester", True)
+    assert result["outcome"] == "refused"
+
+
+@pytest.mark.parametrize("hours", [-1, 0, float("inf"), float("nan")])
+def test_invalid_trend_window_is_structured_error(hours):
+    assert server._trend_impl(hours)["outcome"] == "refused"
 
 
 def test_trend_caps_returned_samples(monkeypatch):

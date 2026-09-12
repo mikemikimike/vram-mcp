@@ -23,7 +23,7 @@ def bytes_to_mb(value, default=None) -> Optional[int]:
     """
     try:
         return int(value) // BYTES_PER_MB
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return default
 
 
@@ -41,7 +41,6 @@ def run_capture(cmd: list[str], timeout: int) -> Optional[str]:
     return result.stdout
 
 
-LOCK_STALE_SECONDS = 30.0
 _REPLACE_ATTEMPTS = 10
 _REPLACE_RETRY_SLEEP = 0.02
 
@@ -60,42 +59,70 @@ def _now() -> datetime:
 
 @contextmanager
 def locked(path: Path, timeout: float = 5.0, poll: float = 0.05):
-    """Serialize access to ``path`` via a sibling ``.lock`` file (O_CREAT|O_EXCL,
-    cross-platform). A lock older than ``LOCK_STALE_SECONDS`` is presumed
-    abandoned (holder hard-killed) and broken. ``TimeoutError`` on a live lock."""
+    """Serialize access through an OS-backed sibling lock file.
+
+    The file is deliberately persistent.  Its *advisory lock*, rather than
+    its age or existence, represents ownership; the OS releases it when a
+    crashed holder exits.  This avoids both stale-file split brain on POSIX and
+    sharing violations from deleting an open lock on Windows.
+    """
     lock_path = path.with_suffix(path.suffix + ".lock")
     path.parent.mkdir(parents=True, exist_ok=True)
     deadline = time.monotonic() + timeout
-    fd = None
-    while fd is None:
-        try:
-            fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-        except FileExistsError:
+    fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR)
+    acquired = False
+    try:
+        # Windows locks byte ranges and cannot lock an empty file.
+        if os.fstat(fd).st_size == 0:
+            os.write(fd, b"\0")
+        while True:
             try:
-                age = time.time() - os.stat(lock_path).st_mtime
-            except OSError:
-                continue
-            if age > LOCK_STALE_SECONDS:
-                try:
-                    os.remove(lock_path)
-                except FileNotFoundError:
-                    pass
-                continue
-            if time.monotonic() >= deadline:
-                raise TimeoutError(f"could not acquire lock {lock_path}")
-            time.sleep(poll)
-    try:
-        os.write(fd, f"{os.getpid()} {iso(_now())}\n".encode("utf-8"))
-    except OSError:
-        pass
-    try:
+                _try_lock(fd)
+                acquired = True
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(f"could not acquire lock {lock_path}")
+                time.sleep(poll)
         yield
     finally:
+        if acquired:
+            try:
+                _unlock(fd)
+            except OSError:
+                pass
         os.close(fd)
+
+
+def _try_lock(fd: int) -> None:
+    """Take a non-blocking exclusive advisory lock, or raise BlockingIOError."""
+    if os.name == "nt":
+        import msvcrt
+
+        os.lseek(fd, 0, os.SEEK_SET)
         try:
-            os.remove(lock_path)
-        except OSError:
-            pass
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+        except OSError as exc:
+            raise BlockingIOError from exc
+    else:
+        import fcntl
+
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise
+
+
+def _unlock(fd: int) -> None:
+    if os.name == "nt":
+        import msvcrt
+
+        os.lseek(fd, 0, os.SEEK_SET)
+        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+    else:
+        import fcntl
+
+        fcntl.flock(fd, fcntl.LOCK_UN)
 
 
 def _quarantine(path: Path) -> None:

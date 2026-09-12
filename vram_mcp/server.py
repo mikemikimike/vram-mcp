@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import functools
 import os
+import math
+import re
 
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -27,9 +29,12 @@ from . import claims as _claims
 from . import core
 from . import nvml as _nvml
 from ._util import iso
-from .gpu import gpu_status
+from .gpu import observe_gpu
+from .models import canonical_model
+from .observations import Observation
+from .validation import nonblank_text
 from .ollama import OllamaClient
-from .ollama_correlate import resolve_tag, runner_pid_map
+from .ollama_correlate import runner_pid_map
 
 mcp = FastMCP("vram-mcp")
 
@@ -39,67 +44,72 @@ _ollama = OllamaClient(base_url=_OLLAMA_BASE_URL)
 from . import audit as _audit
 from . import procinfo as _procinfo
 
+def _numeric_env(name: str, default, *, whole: bool = False, allow_zero: bool = False):
+    try:
+        value = (int if whole else float)(os.environ.get(name, str(default)))
+        if not math.isfinite(value) or value < 0 or (value == 0 and not allow_zero):
+            raise ValueError
+        return value
+    except (ValueError, OverflowError) as exc:
+        qualifier = "non-negative" if allow_zero else "positive"
+        raise ValueError(f"{name} must be a finite {qualifier} {'integer' if whole else 'number'}") from exc
+
+
 _AUDIT_ON = os.environ.get("VRAM_MCP_AUDIT", "1") != "0"
-_MEANINGFUL_MB = int(os.environ.get("VRAM_MCP_MEANINGFUL_MB", "512"))
-_EVENT_CAP = int(os.environ.get("VRAM_MCP_EVENT_CAP", "5000"))
-_SAMPLE_SECONDS = float(os.environ.get("VRAM_MCP_SAMPLE_SECONDS", "60"))
-_SPILL_MB = int(os.environ.get("VRAM_MCP_SPILL_MB", str(core.SPILL_THRESHOLD_MB)))
+_MEANINGFUL_MB = _numeric_env("VRAM_MCP_MEANINGFUL_MB", 512, whole=True)
+_EVENT_CAP = _numeric_env("VRAM_MCP_EVENT_CAP", 5000, whole=True)
+_SAMPLE_SECONDS = _numeric_env("VRAM_MCP_SAMPLE_SECONDS", 60)
+_SPILL_MB = _numeric_env("VRAM_MCP_SPILL_MB", core.SPILL_THRESHOLD_MB, whole=True)
 # trend() output lands in an agent's context window, so the raw rows are capped
 # even though the SUMMARY is always computed over every row in the window.
 _TREND_SAMPLE_CAP = 200
+_GPU_INDEX = _numeric_env("VRAM_MCP_GPU_INDEX", 0, whole=True, allow_zero=True)
 
 
-def _procinfo_table() -> list:
-    """Sized+named process table; the Windows perf-counter fallback only fires
-    when NVML sizes are null (inside win_gpu_procs, which no-ops off-Windows)."""
-    return _procinfo.process_table(
-        nvml_processes=_nvml.nvml_processes,
-        win_gpu_reader=_procinfo.win_gpu_procs,
-        posix_name_reader=_procinfo.posix_name_reader,
-    )
+def _gpu_reading():
+    return observe_gpu(_GPU_INDEX)
+
+
+def _procinfo_table():
+    """Collect the configured device regardless of audit settings."""
+    return _procinfo.observe_processes(_GPU_INDEX)
 
 
 def _run_detection(status: dict) -> None:
-    """Diff the meaningful-holder set from a status snapshot and log changes,
-    then record a throttled free-VRAM sample for ``trend``.
-
-    Best-effort; disabled by VRAM_MCP_AUDIT=0 — never raises (the audit may
-    never break a tool call). The two halves are guarded independently so a
-    sampling failure can't suppress detection, or vice versa.
-
-    A status WITHOUT GPU rows (``list_loaded`` skips the nvidia-smi spawn on
-    purpose) is never sampled: ``used_mb: 0``/``total_mb: 0`` would record a
-    fiction as fact, and — worse — burn the shared once-per-interval throttle
-    slot, so the next REAL sample from ``vram_status`` would be dropped.
-    Detection still runs; only the sample is skipped."""
+    """Audit consumes successful observations; unavailable sources keep their baseline."""
     if not _AUDIT_ON:
         return
-    try:
-        holders = _audit.meaningful_holders(
-            status.get("loaded", []), status.get("other_processes", []), _MEANINGFUL_MB)
-        _audit.detect_and_log(holders, cap=_EVENT_CAP)
-    except Exception:
-        pass
+    readings = status.get("observations", {})
+    for key, kind, values in (("ollama", "ollama", status.get("loaded")),
+                              ("processes", "process", status.get("other_processes"))):
+        reading = readings.get(key)
+        if values is None or reading is None or reading["status"] != "available":
+            continue
+        if kind == "process" and not all(reading.get("coverage", {}).get(key, False)
+                                         for key in ("compute_processes", "graphics_processes")):
+            continue
+        try:
+            holders = _audit.meaningful_holders(
+                values if kind == "ollama" else [], values if kind == "process" else [], _MEANINGFUL_MB)
+            _audit.detect_and_log(holders, observed_kinds={kind},
+                                  observed_at=reading["observed_at"], scope=reading["scope"], cap=_EVENT_CAP)
+        except Exception:
+            pass
     gpus = status.get("gpus") or []
     if not gpus:
         return
     try:
-        p = status.get("pressure") or {}
-        _audit.maybe_log_sample(
-            {
-                "free_mb": p.get("free_mb"),
-                "used_mb": sum(g.get("used_mb") or 0 for g in gpus),
-                "total_mb": sum(g.get("total_mb") or 0 for g in gpus),
-                # The UNEXPLAINED half only. A model's deliberate CPU offload is
-                # reported as its runner's non-local memory too, and persisting
-                # that as spill would make every normal big-model session read
-                # back as hours of driver paging.
-                "spill_mb": p.get("unexplained_spill_mb"),
-                "state": p.get("state"),
-                "loaded_count": len(status.get("loaded", [])),
-            },
-            interval_seconds=_SAMPLE_SECONDS, cap=_EVENT_CAP,
-        )
+        pressure = status.get("pressure") or {}
+        gpu = gpus[0]
+        _audit.maybe_log_sample({
+            "scope": status.get("scope", f"gpu:index={_GPU_INDEX}"),
+            "device_uuid": gpu.get("uuid"),
+            "observed_at": readings.get("gpu", {}).get("observed_at"),
+            "free_mb": pressure.get("free_mb"), "used_mb": gpu.get("used_mb"),
+            "total_mb": gpu.get("total_mb"), "spill_mb": pressure.get("unexplained_spill_mb"),
+            "state": pressure.get("state"), "coverage": pressure.get("coverage"),
+            "loaded_count": len(status["loaded"]) if status.get("loaded") is not None else None,
+        }, interval_seconds=_SAMPLE_SECONDS, cap=_EVENT_CAP)
     except Exception:
         pass
 
@@ -109,37 +119,27 @@ def _fmt_free(free_mb) -> str:
 
 
 def _snapshot() -> core.Snapshot:
-    """One capture of the coordination signals (claims + pid map + busy map),
-    shared across every model an operation touches."""
+    """Capture protection for one status view or one eviction decision."""
     return core.Snapshot.capture(
-        _claims.list_claims, runner_pid_map, _nvml.nvml_busy_map,
+        _claims.list_claims, runner_pid_map,
+        lambda pids: _nvml.nvml_busy_map(pids, index=_GPU_INDEX),
     )
 
 
 def _active_claims() -> tuple[list, bool]:
-    """The ledger's active records for a read-only admission decision, plus
-    whether the read actually succeeded.
-
-    FAILS OPEN by design. ``list_claims`` is lock-free and swallows most IO
-    errors, but a pathological filesystem state can still surface a
-    TimeoutError/OSError, and the alternative — refusing to warm because a
-    small JSON file was momentarily unreadable — is the worse failure: the
-    user's GPU is idle, the refusal is inexplicable to them, and reservations
-    were only ever cooperative advice in the first place. Warming past a
-    reservation we couldn't read is recoverable; a GPU nobody can use is not.
-    Callers get ``ok=False`` so they can say "unknown" rather than "zero"."""
+    """Active records plus explicit health for admission and status."""
     try:
         return _claims.list_claims(), True
-    except (TimeoutError, OSError):
+    except (TimeoutError, OSError, ValueError):
         return [], False
 
 
 def _full_status() -> dict:
     """The enriched combined status both status tools share."""
     return core.combined_status(
-        gpu_status, _ollama,
+        _gpu_reading, _ollama,
         snapshot_fn=_snapshot,
-        procinfo_fn=(_procinfo_table if _AUDIT_ON else _nvml.nvml_processes),
+        procinfo_fn=_procinfo_table,
         spill_threshold_mb=_SPILL_MB,
     )
 
@@ -155,7 +155,7 @@ def _vram_status_impl() -> dict:
     status = _full_status()
     _run_detection(status)
     n_gpu = len(status["gpus"])
-    n_loaded = len(status["loaded"])
+    n_loaded = len(status["loaded"]) if status["loaded"] is not None else "unknown"
     p = status.get("pressure") or {}
     state = p.get("state", "unknown")
     # The pressure detail is the actionable half ("X MB has spilled to system
@@ -173,34 +173,26 @@ def _vram_status_impl() -> dict:
 
 @mcp.tool()
 async def vram_status() -> dict:
-    """Report GPU VRAM and currently loaded Ollama models.
+    """Report the selected GPU and server-wide Ollama model residency.
 
-    Returns per-GPU totals, the list of resident models (each with claim
-    attribution, a best-effort busy signal, and CPU-offload detection), every
-    other VRAM-holding process on the GPU, the best free VRAM, a ``pressure``
-    dict (state ok|tight|degraded|thrashing, reporting driver-forced spill to
-    system RAM — ``unexplained_spill_mb`` — separately from Ollama's deliberate
-    CPU offload — ``explained_offload_mb`` — which Windows reports as the same
-    non-local memory), and a human-readable ``summary``.
+    Includes device identity, source health/timestamps/coverage, claims, recent
+    GPU activity, and pressure (ok|tight|degraded|thrashing|unknown). Unavailable
+    residency is null; unavailable telemetry never establishes an empty or
+    healthy GPU. Non-local memory pressure is a best-effort paging heuristic.
     """
     return await _in_thread(_vram_status_impl)
 
 
 def _list_loaded_impl() -> dict:
-    # Slimmer than _full_status: this tool returns only the model list, so
-    # skip the nvidia-smi spawn — but still gather procinfo (when audit is on)
-    # so detection has a meaningful-holder set to diff against.
     status = core.combined_status(
-        lambda: [], _ollama, snapshot_fn=_snapshot,
-        procinfo_fn=(_procinfo_table if _AUDIT_ON else None),
-        spill_threshold_mb=_SPILL_MB,
+        lambda: Observation(None, "gpu", error="Not collected", scope=f"gpu:index={_GPU_INDEX}"),
+        _ollama, snapshot_fn=_snapshot, spill_threshold_mb=_SPILL_MB,
     )
     _run_detection(status)
     loaded = status["loaded"]
-    return {
-        "loaded": loaded,
-        "summary": f"{len(loaded)} model(s) loaded.",
-    }
+    return {"loaded": loaded, "observations": status["observations"],
+            "summary": f"{len(loaded)} model(s) loaded." if loaded is not None
+            else "Ollama residency is unavailable; loaded models are unknown."}
 
 
 @mcp.tool()
@@ -211,42 +203,54 @@ async def list_loaded() -> dict:
 
 # ── eviction tools ───────────────────────────────────────────────────────────
 
-def _unload_impl(model: str, force: bool, by: str) -> dict:
-    if not force:
-        protected, detail = core.is_protected(model, _snapshot())
-        if protected:
-            _audit.log_action(action="unload", target=model, kind="ollama",
-                              actor=by, force=False, outcome="refused",
-                              detail="protected (claimed or busy)", cap=_EVENT_CAP)
-            summary = (
-                f"'{model}' is protected (claimed or busy); "
-                "pass force=True to override."
-            )
-            if detail["busy"] is True and not detail["claims"]:
-                summary += (
-                    " Note: busy reflects recent GPU activity and can lag a"
-                    " few seconds after a generation ends — if the work you"
-                    " know about has finished, force=True is safe."
-                )
-            return {
-                "ok": False,
-                "model": model,
-                "protected": True,
-                **detail,
-                "summary": summary,
-            }
-    ok = _ollama.unload(model)
-    _audit.log_action(action="unload", target=model, kind="ollama", actor=by,
-                      force=force, outcome=("ok" if ok else "failed"),
-                      detail=("unloaded" if ok else "ollama unload failed"),
-                      cap=_EVENT_CAP)
-    return {
-        "ok": ok,
-        "model": model,
-        "summary": (
-            f"Unloaded '{model}'." if ok else f"Failed to unload '{model}'."
-        ),
-    }
+def _action_result(action: str, model: str, by: str, force: bool, result: dict) -> dict:
+    result = {**result, "model": model}
+    result.setdefault("summary", f"{action.capitalize()} '{model}': {result['outcome']}. "
+                      + result.get("detail", result.get("reason", "")))
+    if _AUDIT_ON:
+        _audit.log_action(action=action, target=model, kind="ollama", actor=by,
+                          force=force, outcome=result["outcome"],
+                          detail=result.get("detail", result.get("reason", "")),
+                          scope=_ollama.base_url, cap=_EVENT_CAP)
+    return result
+
+
+def _mutate(model: str, kind: str, force: bool, by: str, perform) -> dict:
+    """Hold an operation intent through decision, request and reconciliation."""
+    try:
+        model = canonical_model(model)
+        by = nonblank_text(by, "by")
+        slot = _claims.begin_operation(model, kind, force, scope=f"gpu:index={_GPU_INDEX}")
+        if not slot["ok"]:
+            return _action_result(kind, model, by, force, slot)
+        result = {"ok": False, "outcome": "unknown", "detail": "Operation interrupted"}
+        try:
+            result = perform(model)
+        except (ValueError, OSError, TimeoutError) as exc:
+            result = {"ok": False, "outcome": "refused", "detail": str(exc)}
+        finally:
+            try:
+                finished = _claims.finish_operation(slot["operation_id"], uncertain=result["outcome"] == "unknown")
+                slot["expires_at"] = finished.get("expires_at", slot["expires_at"])
+            except (ValueError, OSError, TimeoutError) as exc:
+                result["coordination_warning"] = f"Operation slot cleanup failed: {exc}"
+        if result["outcome"] == "unknown":
+            result["pending_until"] = slot["expires_at"]
+        return _action_result(kind, model, by, force, result)
+    except (ValueError, OSError, TimeoutError) as exc:
+        return {"ok": False, "outcome": "refused", "model": model,
+                "summary": f"{kind.capitalize()} refused: {exc}"}
+
+
+def _unload_impl(model: str, force: bool, by: str, *, action: str = "unload") -> dict:
+    def perform(name):
+        if not force:
+            protected, detail = core.is_protected(name, _snapshot())
+            if protected:
+                return {"ok": False, "outcome": "refused", "protected": True,
+                        **detail, "detail": "Model is claimed or recently busy; force=True overrides protection"}
+        return _ollama.change_residency(name, 0, resident=False)
+    return _mutate(model, action, force, by, perform)
 
 
 @mcp.tool()
@@ -261,55 +265,28 @@ async def unload(model: str, force: bool = False, by: str = "unknown") -> dict:
 
 
 def _ensure_free_impl(gb: float, force: bool, by: str) -> dict:
-    result = core.ensure_free(
-        gb, gpu_status, _ollama, settle=0.5, force=force,
-        snapshot_fn=_snapshot,
-    )
+    try:
+        nonblank_text(by, "by")
+        result = core.ensure_free(
+            gb, _gpu_reading, _ollama, settle=0.5, force=force,
+            evict_fn=lambda name: _unload_impl(name, force, by, action="ensure_free"),
+        )
+    except (ValueError, OSError, TimeoutError) as exc:
+        return {"ok": False, "outcome": "refused", "summary": f"Ensure free refused: {exc}"}
     active, ledger_ok = _active_claims()
-    reserved = core.reserved_mb(active)
-    # None, not 0, when the ledger couldn't be read — "we don't know" and
-    # "nothing is reserved" lead to opposite decisions.
-    result["reserved_mb"] = reserved if ledger_ok else None
-    for name in result["unloaded"]:
-        _audit.log_action(action="ensure_free", target=name, kind="ollama",
-                          actor=by, force=force, outcome="ok",
-                          detail=f"unloaded to free {gb} GB", cap=_EVENT_CAP)
-    for d in result["declined"]:
-        _audit.log_action(action="ensure_free", target=d["name"], kind="ollama",
-                          actor=by, force=force, outcome="refused",
-                          detail="protected (claimed or busy)", cap=_EVENT_CAP)
-    if result["already_free"]:
-        base = f"Already {_fmt_free(result['free_mb'])} free (target {gb} GB)."
-    elif result["ok"]:
-        base = (
-            f"Freed VRAM to {_fmt_free(result['free_mb'])} "
-            f"(target {gb} GB) by unloading: "
-            f"{', '.join(result['unloaded']) or 'none'}."
-        )
-    else:
-        base = (
-            f"Could not reach {gb} GB free "
-            f"(now {_fmt_free(result['free_mb'])}); "
-            f"unloaded: {', '.join(result['unloaded']) or 'none'}."
-        )
-    declined_note = ""
+    result["reserved_mb"] = core.reserved_mb(active) if ledger_ok else None
+    result["summary"] = (
+        f"Target {gb} GB: {result['outcome']}; {_fmt_free(result['free_mb'])} free. "
+        f"Unloaded: {', '.join(result['unloaded']) or 'none'}."
+    )
+    if result.get("detail"):
+        result["summary"] += " " + result["detail"] + "."
     if result["declined"]:
-        names = ", ".join(d["name"] for d in result["declined"])
-        declined_note = f" Protected (force=True to override): {names}."
-    # Freed VRAM isn't necessarily *yours*: another session may have reserved
-    # part of it for non-Ollama work, and it won't show up as a loaded model.
-    if not ledger_ok:
-        reserved_note = (
-            " Note: the claim ledger could not be read, so how much of the "
-            "free VRAM is reserved by other sessions is unknown."
-        )
-    elif reserved:
-        reserved_note = (
-            f" Note: {reserved} MB of the free VRAM is reserved by other sessions."
-        )
-    else:
-        reserved_note = ""
-    result["summary"] = base + declined_note + reserved_note
+        result["summary"] += " Skipped: " + ", ".join(d["name"] for d in result["declined"]) + "."
+    if result["reserved_mb"] is None:
+        result["summary"] += " Reserved capacity is unknown."
+    elif result["reserved_mb"]:
+        result["summary"] += f" {result['reserved_mb']} MB is reserved by other sessions."
     return result
 
 
@@ -324,89 +301,60 @@ async def ensure_free(gb: float, force: bool = False, by: str = "unknown") -> di
 
 
 def _warm_impl(model: str, keep_alive: str, by: str, force: bool) -> dict:
-    admission: Optional[dict] = None
-    if not force:
-        status = core.combined_status(gpu_status, _ollama)
-        # Fails open (see _active_claims): an unreadable ledger reads as "no
-        # reservations", so the warm proceeds rather than being refused for a
-        # reason the user can neither see nor fix.
-        active, _ = _active_claims()
-        reserved = core.reserved_mb(active)
-        # Ollama resolves a bare name to its ":latest" tag, so a raw
-        # tags().get(model) misses on exactly the names users type — and a miss
-        # reads as "size unknown", which walks straight past the
-        # insufficient_headroom refusal this whole feature exists for.
-        sizes = _ollama.tags()
-        tag = resolve_tag(model, sizes)
-        allowed, detail = core.can_warm(
-            model, free_mb=status["free_mb"], reserved_mb=reserved,
-            model_size_mb=(sizes.get(tag) if tag is not None else None),
-        )
-        if not allowed:
-            _audit.log_action(action="warm", target=model, kind="ollama",
-                              actor=by, force=False, outcome="refused",
-                              detail=f"reserved {reserved} MB ({detail['reason']})",
-                              cap=_EVENT_CAP)
-            owners = ", ".join(
-                f"{r.get('owner')} ({r.get('gb')} GB, {r.get('purpose')})"
-                for r in active if r.get("kind") == "reservation"
+    # A zero duration is an eviction and must go through unload protection.
+    if not isinstance(keep_alive, str) or not re.fullmatch(r"(?:-1|(?:[0-9]+(?:\.[0-9]+)?(?:ns|us|ms|s|m|h))+)", keep_alive) or not any(c in "123456789" for c in keep_alive):
+        return {"ok": False, "outcome": "refused", "summary": "keep_alive must be a positive duration (e.g. 5m) or -1; use unload() to evict"}
+
+    def perform(name):
+        admission = None
+        observations = {}
+        if not force:
+            status = core.combined_status(_gpu_reading, _ollama)
+            observations.update(status["observations"])
+            active, ledger_ok = _active_claims()
+            if not ledger_ok or status["loaded"] is None:
+                return {"ok": False, "outcome": "refused", "reason": "observation_unavailable",
+                        "observations": observations,
+                        "detail": "Cannot check residency or reservations; retry after the source recovers"}
+            resident = any(canonical_model(row["name"]) == name for row in status["loaded"])
+            sizes = None
+            if not resident:
+                sizes = _ollama.observe_tags()
+                observations["sizes"] = sizes.metadata()
+            reserved = core.reserved_mb(active)
+            allowed, admission = core.can_warm(
+                name, free_mb=status["free_mb"], reserved_mb=reserved,
+                model_size_mb=sizes.data.get(name) if sizes is not None and sizes.known else None,
+                resident=resident,
             )
-            return {
-                "ok": False, "model": model, "refused": True, **detail,
-                "reservations": owners,
-                "summary": (
-                    f"Refused to warm '{model}': {reserved} MB of VRAM is "
-                    f"reserved [{owners}] leaving {detail['headroom_mb']} MB "
-                    "headroom. Pass force=True to override."
-                ),
-            }
-        admission = detail
-    ok = _ollama.warm(model, keep_alive)
-    _audit.log_action(action="warm", target=model, kind="ollama", actor=by,
-                      force=force, outcome=("ok" if ok else "failed"),
-                      detail=f"keep_alive={keep_alive}", cap=_EVENT_CAP)
-    result = {
-        "ok": ok,
-        "model": model,
-        "keep_alive": keep_alive,
-        "summary": (
-            f"Warmed '{model}' (keep_alive={keep_alive})."
-            if ok
-            else f"Failed to warm '{model}'."
-        ),
-    }
-    # A PASSED check and a check that could not run are different facts, and only
-    # the refusal path used to carry the verdict — so the "size_unknown" outcome
-    # can_warm reports was unobservable to every caller. It matters because
-    # OllamaClient.tags() returns {} on ANY failure: one timed-out /api/tags
-    # makes EVERY model unknown-sized, and admission control silently degrades
-    # wholesale to "allow". Failing open stays the policy; failing open SILENTLY
-    # does not.
-    if admission is not None:
-        result.update(admission)
-        result["size_verified"] = admission["reason"] == "fits"
-        if ok and admission["reason"] == "size_unknown":
-            result["summary"] += (
-                f" Note: {admission['reserved_mb']} MB is reserved by other "
-                f"sessions ({admission['headroom_mb']} MB headroom), but "
-                f"'{model}' size could not be verified — Ollama did not report "
-                "it, so the fit was NOT checked."
-            )
-    return result
+            if not allowed:
+                return {"ok": False, "outcome": "refused", "refused": True, **admission,
+                        "observations": observations,
+                        "reservations": [r for r in active if r.get("kind") == "reservation"],
+                        "detail": f"{reserved} MB is reserved; insufficient headroom. force=True overrides reservations"}
+        result = _ollama.change_residency(name, keep_alive, resident=True)
+        result["keep_alive"] = keep_alive
+        result["observations"] = {**observations, **result.get("observations", {})}
+        if admission is not None:
+            result.update(admission)
+            result["size_verified"] = admission["reason"] == "fits"
+            if admission["reason"] in ("size_unknown", "free_unknown"):
+                result["detail"] += f"; estimated fit not verified ({admission['reason']}, {admission['reserved_mb']} MB reserved)"
+        return result
+    return _mutate(model, "warm", force, by, perform)
 
 
 @mcp.tool()
 async def warm(model: str, keep_alive: str = "5m", by: str = "unknown",
                force: bool = False) -> dict:
-    """Load/pin a model into VRAM for ``keep_alive`` (e.g. ``"5m"``, ``"1h"``).
+    """Load a model or refresh its keep-alive (e.g. "5m"; "-1" pins indefinitely).
 
-    Refuses when active reservations leave no room for the model — pass
-    ``force=True`` to override. ``by`` records the requester in the audit log.
-
-    An allowed warm carries the admission verdict (``reason`` +
-    ``size_verified``): ``size_verified=False`` means the model's size could
-    not be read while reservations were active, so the fit was NOT checked —
-    the load was allowed by fail-open policy, not by passing the check.
+    An already resident model requires zero additional capacity. New loads
+    account for reservations using an approximate model size; size_verified
+    describes that estimate, while outcome describes verified residency.
+    Returns succeeded|refused|failed|unknown. On unknown, inspect residency and
+    pending_until before retrying. force=True bypasses admission checks but
+    cannot override a pending operation. Zero durations must use unload().
     """
     return await _in_thread(_warm_impl, model, keep_alive, by, force)
 
@@ -441,6 +389,8 @@ def _claim_impl(model: str, owner: str, purpose: str, ttl_seconds: int) -> dict:
         return outcome["error"]
     result = outcome["result"]
     result["ok"] = True
+    result["outcome"] = "succeeded"
+    model = result["model"]
     result["summary"] = (
         f"Claimed '{model}' for {owner} ({purpose}), expires {result['expires_at']}."
     )
@@ -529,7 +479,10 @@ async def release(claim_id: str) -> dict:
 
 
 def _list_claims_impl(model: Optional[str]) -> dict:
-    active = _claims.list_claims(model)
+    outcome = _ledger_call("List claims", _claims.list_claims, model)
+    if "error" in outcome:
+        return outcome["error"]
+    active = outcome["result"]
     return {"claims": active, "summary": f"{len(active)} active claim(s)."}
 
 
@@ -542,10 +495,11 @@ async def list_claims(model: Optional[str] = None) -> dict:
 # ── advice ───────────────────────────────────────────────────────────────────
 
 def _advise_impl() -> dict:
-    result = core.advise(gpu_status, _ollama)
+    result = core.advise(_gpu_reading, _ollama)
     n = len(result["suggestions"])
     result["summary"] = (
-        "No VRAM issues detected." if n == 0 else f"{n} suggestion(s)."
+        ("No VRAM issues detected." if result["known"] else "Telemetry is incomplete; health is unknown.")
+        if n == 0 else f"{n} suggestion(s)."
     )
     return result
 
@@ -559,8 +513,14 @@ async def advise() -> dict:
 # ── audit trail ──────────────────────────────────────────────────────────────
 
 def _history_impl(model, type_, limit, since) -> dict:
-    events = _audit.read_events(model=model, type=type_, limit=limit,
-                                since=since, path=_audit.DEFAULT_EVENTS_PATH)
+    try:
+        if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 5000:
+            raise ValueError("limit must be between 1 and 5000")
+        model = canonical_model(model) if model is not None else None
+        events = _audit.read_events(model=model, type=type_, limit=limit,
+                                    since=since, path=_audit.DEFAULT_EVENTS_PATH)
+    except ValueError as exc:
+        return {"ok": False, "outcome": "refused", "summary": str(exc)}
     return {"events": events, "summary": f"{len(events)} event(s)."}
 
 
@@ -575,8 +535,10 @@ async def history(model: str | None = None, type: str | None = None,
 
 
 def _trend_impl(hours: float) -> dict:
+    if not isinstance(hours, (int, float)) or not math.isfinite(hours) or not 0 < hours <= 876000:
+        return {"ok": False, "outcome": "refused", "summary": "hours must be positive, finite, and at most 876000"}
     since = iso(datetime.now(timezone.utc) - timedelta(hours=hours))
-    rows = _audit.read_events(type="sample", limit=10_000, since=since)
+    rows = _audit.read_events(type="sample", limit=10_000, since=since, scope=f"gpu:index={_GPU_INDEX}")
     rows.reverse()  # read_events is newest-first; the summarizer needs oldest-first
     summary = _audit.summarize_samples(rows)
     if summary["count"] == 0:

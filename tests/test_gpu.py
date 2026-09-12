@@ -6,8 +6,8 @@ from vram_mcp import gpu
 
 
 FAKE_CSV = (
-    "0, NVIDIA GeForce RTX 4090, 24564, 8192, 16372\n"
-    "1, NVIDIA GeForce RTX 3060, 12288, 2048, 10240\n"
+    "0, GPU-4090, NVIDIA GeForce RTX 4090, 24564, 24000, 564\n"
+    "1, GPU-3060, NVIDIA GeForce RTX 3060, 12288, 2048, 10240\n"
 )
 
 
@@ -16,23 +16,33 @@ def test_gpu_status_parses_csv():
     assert gpus == [
         {
             "index": 0,
+            "uuid": "GPU-4090",
             "name": "NVIDIA GeForce RTX 4090",
             "total_mb": 24564,
-            "used_mb": 8192,
-            "free_mb": 16372,
-        },
-        {
-            "index": 1,
-            "name": "NVIDIA GeForce RTX 3060",
-            "total_mb": 12288,
-            "used_mb": 2048,
-            "free_mb": 10240,
+            "used_mb": 24000,
+            "free_mb": 564,
         },
     ]
 
 
+def test_gpu_status_selects_requested_device_only():
+    assert gpu.gpu_status(
+        runner=lambda cmd, timeout=5: FAKE_CSV, device_index=1,
+    ) == [{
+        "index": 1, "uuid": "GPU-3060", "name": "NVIDIA GeForce RTX 3060",
+        "total_mb": 12288, "used_mb": 2048, "free_mb": 10240,
+    }]
+
+
+def test_device_one_free_memory_cannot_hide_device_zero_pressure():
+    observation = gpu.observe_gpu(0, runner=lambda cmd, timeout=5: FAKE_CSV)
+    assert observation.known is True
+    assert observation.scope == "gpu:index=0"
+    assert observation.data[0]["free_mb"] == 564
+
+
 def test_gpu_status_skips_blank_lines():
-    csv = "\n0, GPU0, 100, 40, 60\n\n"
+    csv = "\n0, GPU-id, GPU0, 100, 40, 60\n\n"
     gpus = gpu.gpu_status(runner=lambda cmd, timeout=5: csv)
     assert len(gpus) == 1
     assert gpus[0]["free_mb"] == 60
@@ -61,13 +71,32 @@ def test_gpu_status_nonzero_exit_returns_empty():
 
 def test_gpu_status_parse_error_returns_empty():
     # Non-integer memory field -> unparseable -> [].
-    csv = "0, GPU0, N/A, N/A, N/A\n"
+    csv = "0, GPU-id, GPU0, N/A, N/A, N/A\n"
     assert gpu.gpu_status(runner=lambda cmd, timeout=5: csv) == []
 
 
 def test_gpu_status_wrong_column_count_returns_empty():
     csv = "0, GPU0, 100, 40\n"  # only 4 columns
     assert gpu.gpu_status(runner=lambda cmd, timeout=5: csv) == []
+
+
+def test_observe_gpu_distinguishes_failed_from_successful_empty():
+    def missing(cmd, timeout=5):
+        raise FileNotFoundError
+
+    failed = gpu.observe_gpu(runner=missing)
+    empty = gpu.observe_gpu(runner=lambda cmd, timeout=5: "")
+    assert failed.known is False
+    assert failed.data is None
+    assert failed.metadata()["status"] == "unavailable"
+    assert empty.known is True
+    assert empty.data == []
+
+
+def test_observe_gpu_reports_missing_selected_index():
+    result = gpu.observe_gpu(2, runner=lambda cmd, timeout=5: FAKE_CSV)
+    assert result.known is False
+    assert "index 2" in result.error
 
 
 def test_gpu_status_default_runner_no_nvidia_smi(monkeypatch):
@@ -80,8 +109,14 @@ def test_gpu_status_default_runner_no_nvidia_smi(monkeypatch):
 
 
 def test_max_free_mb():
-    gpus = [{"free_mb": 100}, {"free_mb": 500}, {"free_mb": 250}]
-    assert gpu.max_free_mb(gpus) == 500
+    assert gpu.max_free_mb([{"free_mb": 100}]) == 100
+
+
+def test_max_free_mb_rejects_cross_device_maximum():
+    import pytest
+
+    with pytest.raises(ValueError, match="selected GPU"):
+        gpu.max_free_mb([{"free_mb": 100}, {"free_mb": 500}])
 
 
 def test_max_free_mb_empty_is_none():

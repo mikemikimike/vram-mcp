@@ -1,5 +1,7 @@
 """Tests for vram_mcp.nvml — pure, no real GPU/driver needed."""
 
+import time
+
 from vram_mcp import nvml as nvml_mod
 
 
@@ -19,9 +21,10 @@ class _Proc:
 
 
 class _UtilSample:
-    def __init__(self, pid, sm_util):
+    def __init__(self, pid, sm_util, timestamp=None):
         self.pid = pid
         self.smUtil = sm_util
+        self.timeStamp = timestamp if timestamp is not None else int(time.time() * 1_000_000)
 
 
 class FakeNvml:
@@ -44,6 +47,7 @@ class FakeNvml:
         self.fail_utilization = fail_utilization
         self.shutdown_called = False
         self.utilization_calls = 0
+        self.utilization_timestamp = None
         self.nvmlMemory_v2 = "v2-marker"
 
     def nvmlInit(self):
@@ -79,6 +83,7 @@ class FakeNvml:
 
     def nvmlDeviceGetProcessUtilization(self, handle, timestamp):
         self.utilization_calls += 1
+        self.utilization_timestamp = timestamp
         if self.fail_utilization:
             raise FakeNVMLError("not supported")
         return self._util
@@ -154,8 +159,39 @@ def test_nvml_processes_partial_failure_still_returns_other_list():
     assert result == [{"pid": 300, "size_mb": 50, "kind": "graphics"}]
 
 
+def test_observe_processes_reports_partial_query_coverage():
+    fake = FakeNvml(fail_compute=True, graphics_procs=[_Proc(300, 50 * 1024**2)])
+    result = nvml_mod.observe_processes(nvml=fake)
+    assert result.known is True
+    assert result.coverage == {
+        "compute_processes": False,
+        "graphics_processes": True,
+    }
+
+
 def test_nvml_processes_empty_when_unavailable():
     assert nvml_mod.nvml_processes(nvml=FakeNvml(fail_init=True)) == []
+
+
+def test_observe_processes_distinguishes_unavailable_from_empty():
+    unavailable = nvml_mod.observe_processes(nvml=FakeNvml(fail_init=True))
+    empty = nvml_mod.observe_processes(nvml=FakeNvml())
+    assert unavailable.known is False
+    assert unavailable.data is None
+    assert empty.known is True
+    assert empty.data == []
+    assert empty.scope == "gpu:index=0"
+    assert empty.coverage == {
+        "compute_processes": True,
+        "graphics_processes": True,
+    }
+
+
+def test_observe_processes_uses_selected_device_index():
+    fake = FakeNvml()
+    result = nvml_mod.observe_processes(1, nvml=fake)
+    assert result.known is True
+    assert result.scope == "gpu:index=1"
 
 
 def test_nvml_busy_true_when_sample_has_positive_sm_util():
@@ -195,6 +231,25 @@ def test_nvml_busy_map_mixed_verdicts_in_one_fetch():
     assert fake.shutdown_called is True
 
 
+def test_nvml_busy_map_ignores_stale_samples():
+    now = 1_000.0
+    fake = FakeNvml(util_samples=[
+        _UtilSample(111, 80, int((now - 30) * 1_000_000)),
+        _UtilSample(222, 0, int((now - 1) * 1_000_000)),
+    ])
+    result = nvml_mod.nvml_busy_map(
+        [111, 222], nvml=fake, now_fn=lambda: now, recent_seconds=5,
+    )
+    assert result == {111: None, 222: False}
+    assert fake.utilization_timestamp == int((now - 5) * 1_000_000)
+
+
+def test_nvml_busy_map_ignores_sample_without_timestamp():
+    undated = type("UndatedSample", (), {"pid": 111, "smUtil": 80})()
+    fake = FakeNvml(util_samples=[undated])
+    assert nvml_mod.nvml_busy_map([111], nvml=fake) == {111: None}
+
+
 def test_nvml_busy_map_empty_pids_never_touches_nvml():
     assert nvml_mod.nvml_busy_map([], nvml=ExplodingNvml()) == {}
 
@@ -202,6 +257,14 @@ def test_nvml_busy_map_empty_pids_never_touches_nvml():
 def test_nvml_busy_map_all_none_when_unavailable():
     fake = FakeNvml(fail_init=True)
     assert nvml_mod.nvml_busy_map([111, 222], nvml=fake) == {111: None, 222: None}
+
+
+def test_nvml_busy_map_all_none_when_nvml_import_is_unavailable(monkeypatch):
+    def missing():
+        raise ImportError("missing")
+
+    monkeypatch.setattr(nvml_mod, "_default_nvml", missing)
+    assert nvml_mod.nvml_busy_map([111, 222]) == {111: None, 222: None}
 
 
 def test_legacy_nvml_attribute_errors_degrade_to_defaults():

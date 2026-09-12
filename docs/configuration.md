@@ -44,7 +44,8 @@ clients sharing one GPU and ledger.
 | --- | --- | --- |
 | `OLLAMA_BASE_URL` | `http://127.0.0.1:11434` | Ollama HTTP endpoint. |
 | `OLLAMA_MODELS` | `~/.ollama/models` | Local model directory used to correlate manifests with runner processes. Match the directory used by Ollama. |
-| `VRAM_MCP_AUDIT` | `1` | Enable passive change detection, enriched process readings, and trend sampling. Set exactly `0` to disable. |
+| `VRAM_MCP_GPU_INDEX` | `0` | Zero-based NVIDIA GPU index used for capacity, process, activity, pressure, trend, and eviction decisions. Use the same value across coordinating clients. |
+| `VRAM_MCP_AUDIT` | `1` | Enable passive appearance/disappearance detection and trend sampling. Set exactly `0` to disable. |
 | `VRAM_MCP_MEANINGFUL_MB` | `512` | Minimum dedicated VRAM in MB for tracking a non-Ollama process in appearance/disappearance events. |
 | `VRAM_MCP_EVENT_CAP` | `5000` | Maximum retained events, including samples; oldest entries are pruned. |
 | `VRAM_MCP_SAMPLE_SECONDS` | `60` | Minimum interval between trend samples, shared across sessions. |
@@ -60,12 +61,19 @@ For clients using `mcpServers` JSON, add an `env` object to the server entry:
       "args": ["--from", "git+https://github.com/sushiHex/vram-mcp", "vram-mcp"],
       "env": {
         "OLLAMA_BASE_URL": "http://127.0.0.1:11434",
+        "VRAM_MCP_GPU_INDEX": "0",
         "VRAM_MCP_SAMPLE_SECONDS": "60"
       }
     }
   }
 }
 ```
+
+Numeric configuration is validated when the MCP server starts. Values such as
+a negative GPU index, a nonnumeric threshold, or a nonpositive retention/sample
+setting prevent startup instead of silently changing the meaning of a reading.
+If registration succeeds but the client cannot start the server, inspect its
+MCP server log for the named environment variable and required value type.
 
 `advise()` may suggest `OLLAMA_MAX_LOADED_MODELS` or `OLLAMA_KEEP_ALIVE`.
 Those belong to the **Ollama server's environment**; setting them only on the
@@ -79,22 +87,49 @@ not move those collectors. For coherent memory decisions, run the MCP server
 alongside Ollama with access to its model directory and runner processes.
 A container or different OS user may expose different processes and files.
 
+`VRAM_MCP_GPU_INDEX` scopes local capacity, process, busy, pressure, and trend
+readings to one device. Ollama's `/api/ps` response is global to the configured
+Ollama server and does not say which GPU holds each model. On a multi-GPU or
+remote-Ollama setup, a loaded model may therefore be listed without proof that
+it resides on the selected local GPU. Check the response's `scope` and
+`observations` before combining those facts. GPU rows also include the device
+UUID when `nvidia-smi` reports it, which lets operators verify that an index
+still names the intended card after hardware or driver changes.
+
+### Observation health
+
+`vram_status()` reports source metadata under `observations`. Each entry has a
+`status` of `available` or `unavailable`, its `source`, collection time, and
+scope; failures also include `error`. Unavailable model/process data is returned
+as `null`; GPU failures retain `gpus=[]` with unavailable metadata and
+`free_mb=null`. This distinction lets callers separate “no models/processes”
+from “the source could not be queried.”
+
+Process metadata also reports whether non-local memory is covered. Current
+NVML process readings do not provide selected-device non-local memory. Windows
+GPU Process Memory counters aggregate adapters, so vram-mcp uses them only to
+name processes and reports `non_local_memory=false` rather than assigning their
+totals to the selected GPU. Compute and graphics process-query coverage are
+reported separately; either query may be unavailable while the other's rows
+remain useful.
+
 ### Audit cost and coverage
 
-On Windows/WDDM, NVML often cannot report per-process memory sizes. Auditing
-adds a performance-counter sample and process lookup to `vram_status()` and
-`list_loaded()`, costing roughly one second per call on the measured setup.
-The resulting process table supplies sizes and, where available, names and
-command lines.
+On Windows/WDDM, NVML often cannot report per-process memory sizes. A
+`vram_status()` call adds a performance-counter sample and process lookup,
+costing roughly one second on the measured setup. Those adapter-aggregated
+counters supply names and command lines, but their memory totals are not used
+for selected-device capacity or spill decisions.
 
-`VRAM_MCP_AUDIT=0` skips that enrichment and disables appearance/disappearance
-detection, driver-spill detection, and new trend samples. Status falls back to
-NVML process data, with sizes where available. Claims, busy detection, model
-operations, and action logging remain enabled. Old audit events remain queryable.
+`VRAM_MCP_AUDIT=0` disables action logging, appearance/disappearance detection,
+and new trend samples. It does not disable current GPU, process, model, or
+activity observations. Claims and model operations remain enabled, and old
+audit events remain queryable.
 
-Without the Windows non-local-memory counters, pressure may still report
-`ok`, `tight`, or `degraded`, but cannot diagnose `thrashing`. Missing process
-information is not evidence that nothing else is using the GPU.
+Pressure can report `ok`, `tight`, or `degraded` from the evidence it has.
+`thrashing` additionally requires scoped non-local-memory coverage. When that
+coverage is false, spill is unknown; missing process information is not evidence
+that nothing else is using the GPU.
 
 Keep the sample interval high enough that samples do not crowd action events
 out of the bounded log. Raising the spill floor can suppress noisy alerts;
@@ -106,10 +141,11 @@ it does not create additional GPU capacity.
 | --- | --- |
 | Client cannot start the server | Confirm Git and uv are installed and visible to the client. Use an absolute `uvx` or installed executable path if its PATH differs from your terminal's. Allow time for the first dependency download. |
 | Starting `vram-mcp` appears to hang | It is waiting for MCP input over stdio. Connect through an MCP client. |
-| `free_mb` is `null` or `gpus` is empty | Run `nvidia-smi` in the server's environment and check driver availability. Model operations can work without memory telemetry. |
-| No loaded models appear | Check `ollama ps` and the configured endpoint. An unreachable Ollama endpoint also produces an empty model list. |
+| `free_mb` is `null` or `gpus` is empty | Read `observations.gpu.error`, run `nvidia-smi` in the server's environment, and confirm the configured `VRAM_MCP_GPU_INDEX` is present. |
+| `loaded` is `null` | Read `observations.ollama.error`, then check `ollama ps` and `OLLAMA_BASE_URL`. A known empty list means Ollama was reached and reported no resident models. |
 | `busy` is `null` | NVML activity or model-to-process correlation is unavailable. Check access to runner processes and the model directory; keep explicit claims for work in use. |
-| `warm` returns `ok=false` | Read `summary` and `reason`: a reservation refusal differs from an Ollama failure. Check that the model is installed and Ollama is reachable; recheck status after a timeout before retrying. |
+| A mutation returns `outcome="unknown"` | Read its observation metadata. If `pending_until` is present, the Ollama request may still finish; do not retry that model before then. For `ensure_free`, inspect `attempts` for a pending eviction. |
+| `warm` is refused | Read `summary`, `reason`, and `observations`. Fix unavailable residency/ledger health, or resolve a reservation. `force=true` overrides admission policy, but still requires a healthy coordination ledger. |
 | `trend()` has no samples | Call `vram_status()` with working GPU telemetry and auditing enabled. `list_loaded()` never samples GPU memory; historical data is not collected in the background. |
 | A model is protected after inference ends | Check active claims. Busy detection uses a recent activity window and can lag by a few seconds; recheck before considering an override. |
 

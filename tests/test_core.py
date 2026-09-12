@@ -1,6 +1,7 @@
 """Tests for vram_mcp.core — pure orchestration with injected fakes."""
 
 from vram_mcp import core
+from vram_mcp.observations import Observation
 
 
 _MB = 1024 * 1024
@@ -71,6 +72,38 @@ def test_combined_status_no_gpu():
     assert status["gpus"] == []
     assert status["free_mb"] is None
     assert status["loaded"] == []
+
+
+def test_failed_model_read_is_unknown_not_empty_or_healthy():
+    class Unavailable(FakeOllama):
+        def observe_loaded(self):
+            return Observation(None, "ollama", error="offline")
+    status = core.combined_status(gpu_fn_const(6000), Unavailable())
+    assert status["loaded"] is None
+    assert status["pressure"]["state"] == "unknown"
+    assert status["observations"]["ollama"]["status"] == "unavailable"
+
+
+def test_unrelated_gpu_does_not_hide_selected_device_pressure():
+    reading = Observation([{"index": 0, "free_mb": 128}, {"index": 1, "free_mb": 24000}],
+                          "gpu", scope="gpu:index=0")
+    status = core.combined_status(lambda: reading, FakeOllama())
+    assert status["free_mb"] == 128
+    assert status["pressure"]["state"] == "tight"
+
+
+def test_other_device_process_reading_cannot_invent_local_spill():
+    gpu = Observation([{"index": 0, "free_mb": 2048}], "gpu", scope="gpu:index=0")
+    processes = Observation([{"pid": 10, "non_local_mb": 8000}], "nvml", scope="gpu:index=1")
+    status = core.combined_status(lambda: gpu, FakeOllama(), procinfo_fn=lambda: processes)
+    assert status["other_processes"] is None
+    assert status["pressure"]["spilling"] is None
+
+
+def test_missing_model_memory_is_not_reported_as_zero():
+    status = core.combined_status(gpu_fn_const(6000), FakeOllama([{"name": "m"}]))
+    assert status["loaded"][0]["size_vram_mb"] is None
+    assert status["loaded"][0]["offloaded_to_cpu"] is None
 
 
 # ---- offload detection -------------------------------------------------------
@@ -374,7 +407,7 @@ def test_pressure_tolerates_none_values():
     p = core.pressure([{"index": 0, "free_mb": None}], [{"name": None}], procs)
     assert p["non_local_mb"] == 0
     assert p["free_mb"] is None
-    assert p["state"] == "ok"
+    assert p["state"] == "unknown"
 
 
 def test_combined_status_includes_pressure():
@@ -713,26 +746,21 @@ def test_ensure_free_skips_protected_model_and_reports_declined():
     assert result["declined"][0]["name"] == "protected"
 
 
-def test_ensure_free_snapshots_once_for_the_whole_pass():
-    """The coordination snapshot is captured ONCE per ensure_free call, not
-    per candidate model — the old shape re-ran subprocess/NVML/file reads
-    every loop iteration."""
-    models = [
-        {"name": "a", "size_vram": gb_bytes(4), "expires_at": None},
-        {"name": "b", "size_vram": gb_bytes(4), "expires_at": None},
-        {"name": "c", "size_vram": gb_bytes(4), "expires_at": None},
-    ]
-    ollama = FakeOllama(models)
-    gpu_fn = gpu_fn_sequence([1000, 2000, 3000, 13000])
-    calls = {"n": 0}
+def test_ensure_free_rechecks_claims_after_each_eviction():
+    claims = []
 
-    def snapshot_fn():
-        calls["n"] += 1
-        return _snap()
+    class ClaimingOllama(FakeOllama):
+        def unload(self, name):
+            self.unloaded.append(name)
+            claims.append({"model": "b:latest", "owner": "new session"})
+            return True
 
-    core.ensure_free(12, gpu_fn, ollama, sleep=lambda *_: None,
-                     snapshot_fn=snapshot_fn)
-    assert calls["n"] == 1
+    ollama = ClaimingOllama([{"name": "a", "size_vram": gb_bytes(8)},
+                            {"name": "b", "size_vram": gb_bytes(4)}])
+    result = core.ensure_free(12, gpu_fn_sequence([1000, 9000]), ollama,
+                              snapshot_fn=lambda: _snap(all_claims=list(claims)))
+    assert ollama.unloaded == ["a"]
+    assert result["declined"][0]["name"] == "b"
 
 
 def test_ensure_free_force_bypasses_protection_without_snapshotting():

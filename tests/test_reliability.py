@@ -7,7 +7,12 @@ exercise integration seams without consulting Ollama, a GPU, or user state.
 from __future__ import annotations
 
 import json
+import os
+import subprocess
+import sys
+import time
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 import requests
@@ -242,6 +247,59 @@ def test_unknown_timeout_releases_owner_but_retains_lease_and_blocks_claim(
     claims._release_operation_lock(fd)
     with pytest.raises(ValueError, match="operation pending"):
         claims.claim("timeout-model:latest", "session-b", "generation")
+
+
+def test_subprocess_live_owner_survives_expired_lease_in_list_coordination(tmp_path):
+    """A real second process remains visible after its nominal lease expires."""
+    path = tmp_path / "claims.json"
+    ready = tmp_path / "ready"
+    release = tmp_path / "release"
+    script = """
+import sys
+import time
+from pathlib import Path
+from vram_mcp import claims
+
+path = Path(sys.argv[1])
+ready = Path(sys.argv[2])
+release = Path(sys.argv[3])
+operation = claims.begin_operation("live-model", "unload", force=True, path=path)
+ready.write_text(operation["operation_id"], encoding="utf-8")
+while not release.exists():
+    time.sleep(0.01)
+claims.finish_operation(operation["operation_id"], path=path)
+"""
+    environment = os.environ.copy()
+    source_root = str(Path(__file__).resolve().parents[1])
+    environment["PYTHONPATH"] = source_root + os.pathsep + environment.get("PYTHONPATH", "")
+    process = subprocess.Popen(
+        [sys.executable, "-c", script, str(path), str(ready), str(release)],
+        cwd=source_root, env=environment,
+    )
+    try:
+        deadline = time.monotonic() + 10
+        while not ready.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert ready.exists(), process.communicate(timeout=1)
+        record = json.loads(path.read_text(encoding="utf-8"))["operations"][0]
+        started_at = claims._parse_iso(record["started_at"])
+        future = started_at + timedelta(seconds=claims._OPERATION_LEASE_SECONDS + 1)
+        state = claims.list_coordination(path=path, now_fn=lambda: future)
+        [operation] = state["operations"]
+        assert operation["operation_id"] == ready.read_text(encoding="utf-8")
+        assert operation["owner_live"] is True
+        assert operation["lease_expired"] is True
+        assert operation["lifecycle"] == "in_flight"
+        assert operation["outcome"] is None
+    finally:
+        release.write_text("done", encoding="utf-8")
+        try:
+            process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=2)
+            raise
+    assert process.returncode == 0
 
 
 def test_failed_readonly_ollama_observation_preserves_audit_baseline(

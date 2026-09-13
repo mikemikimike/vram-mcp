@@ -67,6 +67,31 @@ starting a job. The ledger is cooperative; direct Ollama requests bypass it.
 vram-mcp does, however, serialize its own same-model mutations with a durable
 pending-operation record.
 
+### Inspect pending operations
+
+`list_claims()` returns one consistent ledger view with both `claims` and
+`operations`. Passing `model` applies the same canonical model filter to both
+arrays; reservations remain visible only in an unfiltered view. Every operation
+entry has this stable shape:
+
+| Field | Meaning |
+| --- | --- |
+| `operation_id` | Stable identifier for the mutation attempt. |
+| `model`, `kind`, `scope` | Canonical model, mutation kind (`warm` or `unload`), and selected GPU scope. |
+| `started_at`, `expires_at`, `pending_until` | ISO timestamps. `pending_until` is the current retry boundary and normally equals `expires_at`. |
+| `lifecycle` | `in_flight` while the owner may still be doing backend work; `unknown` after the backend result could not be established. |
+| `owner_live` | Whether the operation's OS owner lock is currently held. |
+| `lease_expired` | Whether the wall-clock lease has elapsed; this never overrides `owner_live`. |
+| `outcome`, `reason` | `null` while in flight; `unknown` and the retained reason for an uncertain operation. |
+| `retry_count`, `retry_after` | Number of retries already made and the next safe retry time, or `null` while in flight. |
+
+An operation with `owner_live=true` continues to block the same-model mutation
+even when `lease_expired=true`. A lease is safe to discard only when its owner
+lock is no longer held. An unknown operation has `owner_live=false` and remains
+visible until `pending_until`; it blocks a retry during that window. The list
+call refreshes the view from disk, so a renewed pending expiry is returned
+exactly as stored.
+
 ### Interpreting a warm result
 
 A normal `warm()` checks free memory minus active reservations against an
@@ -112,6 +137,33 @@ residency reads; it does not blindly retry an uncertain POST. An unknown result
 keeps a bounded operation record and returns `pending_until`. Claims and other
 same-model mutations are refused during that window, preventing a timeout from
 immediately racing with a conflicting request.
+
+All coordination mutation responses include `ok`, `outcome`, `model`,
+`reason`, `detail`, and `summary`. `reason` describes a local decision such as
+`model_claimed`, `operation_pending`, or `insufficient_headroom`; it is `null`
+when there is no local decision to explain. `detail` is human-readable backend
+or observation context and is also `null` when no extra detail exists. The
+outcome meanings are independent of the local reason:
+
+| Outcome | Meaning | Retry guidance |
+| --- | --- | --- |
+| `succeeded` | The requested state was observed after the request. | No retry is needed. |
+| `refused` | No backend mutation was sent because local validation, coordination, protection, or admission rejected it. | Resolve the reported `reason`; a pending operation is visible in `operations`. |
+| `failed` | The backend definitively rejected the request. | Retry only after addressing the backend error. |
+| `unknown` | The request may have reached the backend, but its final state is unverified. | Do not repeat the mutation until `pending_until`/`retry_after`; inspect `list_claims()` first. |
+
+For example, an agent recovering after a disconnect can inspect and act on the
+same operation without guessing from a timeout:
+
+```text
+list_claims(model="llama3")
+```
+
+If the returned operation has `lifecycle="unknown"`, `outcome="unknown"`, and
+`retry_after="2026-09-13T12:02:00Z"`, inspect residency after that boundary and
+retry only if the operation is gone or no longer blocks the model. If it has
+`lifecycle="in_flight"` and `owner_live=true`, wait for the live owner even when
+`lease_expired=true`.
 
 Warm admission also consumes shared selected-GPU capacity, so only one warm may
 pass admission at a time per GPU scope, even when the model names differ. A new

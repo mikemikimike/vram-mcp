@@ -169,8 +169,76 @@ def test_warm_forced_reports_no_admission_verdict(warm_env):
     warm_env.setattr(server._ollama, "observe_tags", lambda: Observation({}, "sizes"))
     result = server._warm_impl("qwen3:32b", "5m", "tester", True)
     assert result["ok"] is True
-    assert "size_verified" not in result
-    assert "reason" not in result
+    assert result["size_verified"] is None
+    assert result["reason"] is None
+
+
+class _SchemaBackend:
+    base_url = "http://ollama.test:11434"
+
+    def __init__(self, outcome):
+        self.outcome = outcome
+
+    def change_residency(self, model, _keep_alive, *, resident):
+        return {
+            "ok": self.outcome == "succeeded",
+            "outcome": self.outcome,
+            "model": model,
+            "resident": resident if self.outcome == "succeeded" else None,
+            "detail": f"fake {self.outcome} result",
+        }
+
+
+def _validate_tool_output(name, result):
+    tool = server.mcp._tool_manager.get_tool(name)
+    assert tool.fn_metadata.output_schema is not None
+    return tool.fn_metadata.output_model.model_validate(result)
+
+
+def test_coordination_tools_publish_and_validate_stable_outputs(monkeypatch):
+    names = ["claim", "reserve", "renew", "release", "list_claims",
+             "unload", "warm", "ensure_free"]
+    for name in names:
+        assert server.mcp._tool_manager.get_tool(name).fn_metadata.output_schema is not None
+
+    monkeypatch.setattr(server, "_ollama", _SchemaBackend("succeeded"))
+    success = server._unload_impl("success", True, "tester")
+    _validate_tool_output("unload", success)
+    assert success["outcome"] == "succeeded"
+
+    monkeypatch.setattr(server, "_ollama", _SchemaBackend("failed"))
+    failed = server._unload_impl("failed", True, "tester")
+    _validate_tool_output("unload", failed)
+    assert failed["outcome"] == "failed"
+
+    monkeypatch.setattr(server, "_ollama", _SchemaBackend("unknown"))
+    unknown = server._unload_impl("uncertain", True, "tester")
+    _validate_tool_output("unload", unknown)
+    assert unknown["outcome"] == "unknown"
+    assert unknown["pending_until"] is not None
+
+    refused = server._unload_impl("uncertain", True, "tester")
+    _validate_tool_output("unload", refused)
+    assert refused["outcome"] == "refused"
+    assert refused["reason"] == "operation_pending"
+    server._claims.finish_operation(unknown["operation_id"])
+
+    claim_result = server._claim_impl("claimed", "owner", "purpose", 60)
+    _validate_tool_output("claim", claim_result)
+    reserve_result = server._reserve_impl(1, "owner", "purpose", 60, None)
+    _validate_tool_output("reserve", reserve_result)
+    renew_result = server._renew_impl(claim_result["claim_id"], 60)
+    _validate_tool_output("renew", renew_result)
+    release_result = server._release_impl(claim_result["claim_id"])
+    _validate_tool_output("release", release_result)
+
+    list_result = server._list_claims_impl(None)
+    _validate_tool_output("list_claims", list_result)
+    assert list_result["operations"] == []
+
+    monkeypatch.setattr(server, "_gpu_reading", lambda: [{"free_mb": 4096}])
+    ensure_result = server._ensure_free_impl(1, False, "tester")
+    _validate_tool_output("ensure_free", ensure_result)
 
 
 def test_warm_resident_refresh_requires_no_additional_capacity(warm_env):

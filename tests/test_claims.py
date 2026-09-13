@@ -505,3 +505,53 @@ def test_reservation_waits_for_any_warm_admission_to_resolve(tmp_path):
     finally:
         claims.finish_operation(started["operation_id"], path=path, now_fn=lambda: _T0)
     assert claims.reserve(8, "owner", "purpose", path=path, now_fn=lambda: _T0)["claim_id"]
+
+
+def test_list_coordination_returns_filtered_claims_and_operations(tmp_path):
+    path = tmp_path / "claims.json"
+    claims.claim("Llama3", "owner", "generation", path=path, now_fn=lambda: _T0)
+    claims.reserve(4, "trainer", "lora", path=path, now_fn=lambda: _T0)
+    started = claims.begin_operation(
+        "llama3:latest", "unload", force=True, scope="gpu:index=1",
+        path=path, now_fn=lambda: _T0,
+    )
+    try:
+        state = claims.list_coordination(path=path, now_fn=lambda: _T0)
+        assert len(state["claims"]) == 2
+        assert len(state["operations"]) == 1
+        operation = state["operations"][0]
+        assert operation["operation_id"] == started["operation_id"]
+        assert operation["model"] == "llama3:latest"
+        assert operation["scope"] == "gpu:index=1"
+        assert operation["lifecycle"] == "in_flight"
+        assert operation["outcome"] is None
+        assert operation["retry_count"] == 0
+        assert operation["retry_after"] is None
+
+        filtered = claims.list_coordination("LLAMA3", path=path, now_fn=lambda: _T0)
+        assert [entry["model"] for entry in filtered["claims"]] == ["llama3:latest"]
+        assert [entry["model"] for entry in filtered["operations"]] == ["llama3:latest"]
+    finally:
+        claims.finish_operation(started["operation_id"], path=path, now_fn=lambda: _T0)
+
+
+def test_list_coordination_reports_unknown_until_refreshed_expiry(tmp_path):
+    path = tmp_path / "claims.json"
+    clock = _clock(_T0)
+    started = claims.begin_operation("model", "unload", force=True, path=path, now_fn=clock)
+    finished = claims.finish_operation(
+        started["operation_id"], uncertain=True, reason="request_interrupted",
+        path=path, now_fn=clock,
+    )
+    state = claims.list_coordination(path=path, now_fn=clock)
+    [operation] = state["operations"]
+    assert operation["lifecycle"] == "unknown"
+    assert operation["owner_live"] is False
+    assert operation["lease_expired"] is False
+    assert operation["outcome"] == "unknown"
+    assert operation["reason"] == "request_interrupted"
+    assert operation["pending_until"] == finished["expires_at"]
+    assert operation["retry_after"] == finished["expires_at"]
+
+    clock.tick(claims._OPERATION_LEASE_SECONDS + 1)
+    assert claims.list_coordination(path=path, now_fn=clock)["operations"] == []

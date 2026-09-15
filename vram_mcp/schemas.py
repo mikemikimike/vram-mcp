@@ -7,7 +7,8 @@ the same fields present for successful, refused, failed, and unknown results.
 
 from __future__ import annotations
 
-from typing import Any, Literal, TypedDict
+from typing import Any, Literal
+from typing_extensions import TypedDict
 
 
 Outcome = Literal["succeeded", "refused", "failed", "unknown"]
@@ -15,17 +16,17 @@ OperationLifecycle = Literal["in_flight", "unknown"]
 
 
 class ClaimEntry(TypedDict):
-    claim_id: str
+    claim_id: str | None
     kind: Literal["model", "reservation"]
     model: str | None
     gb: float | None
     pid: int | None
-    owner: str
-    purpose: str
-    claimed_at: str
-    renewed_at: str
-    ttl_seconds: int
-    expires_at: str
+    owner: str | None
+    purpose: str | None
+    claimed_at: str | None
+    renewed_at: str | None
+    ttl_seconds: int | None
+    expires_at: str | None
 
 
 class OperationEntry(TypedDict):

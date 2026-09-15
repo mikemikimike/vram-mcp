@@ -5,6 +5,8 @@ than failed where that package is absent, so the pure-module suite still runs
 anywhere. Every audit call here is monkeypatched: these tests must never touch
 the real ``~/.cache/vram-mcp`` files.
 """
+import json
+
 import pytest
 
 pytest.importorskip("mcp")
@@ -264,6 +266,22 @@ def test_coordination_refusal_fields_survive_structured_output(monkeypatch):
         assert result["scope"] == f"gpu:index={server._GPU_INDEX}"
     finally:
         server._claims.finish_operation(pending["operation_id"])
+
+
+def test_malformed_claim_stays_visible_in_structured_protection_refusal():
+    path = server._claims._DEFAULT_PATH
+    path.write_text(json.dumps({"claims": [{
+        "claim_id": "claim", "model": "model:latest", "owner": "owner",
+        "purpose": "purpose", "claimed_at": "2099-07-13T18:00:00Z",
+        "renewed_at": "2099-07-13T18:00:00Z", "ttl_seconds": 3600.0,
+        "expires_at": "2099-07-13T19:00:00Z",
+    }]}), encoding="utf-8")
+    result = server._unload_impl("model", False, "tester")
+    _validate_tool_output("unload", result)
+    assert result["outcome"] == "refused"
+    assert result["reason"] == "model_claimed"
+    assert result["claims"][0]["claim_id"] == "claim"
+    assert result["claims"][0]["ttl_seconds"] is None
 
 
 def test_can_warm_free_mb_survives_structured_output(warm_env):

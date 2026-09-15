@@ -418,6 +418,23 @@ def test_begin_operation_refuses_claimed_model_and_returns_claim_detail(tmp_path
     assert result["claims"][0]["model"] == "model:latest"
 
 
+def test_malformed_active_claim_still_blocks_and_is_visible(tmp_path):
+    path = tmp_path / "claims.json"
+    path.write_text(json.dumps({"claims": [{
+        "claim_id": "claim", "model": "model:latest", "owner": "owner",
+        "purpose": "purpose", "claimed_at": "2026-07-13T18:00:00Z",
+        "renewed_at": "2026-07-13T18:00:00Z", "ttl_seconds": 3600.0,
+        "expires_at": "2026-07-13T19:00:00Z",
+    }]}), encoding="utf-8")
+
+    listed = claims.list_coordination(path=path, now_fn=lambda: _T0)
+    assert listed["claims"][0]["claim_id"] == "claim"
+    assert listed["claims"][0]["ttl_seconds"] is None
+    refused = claims.begin_operation("model", "unload", path=path, now_fn=lambda: _T0)
+    assert refused["reason"] == "model_claimed"
+    assert refused["claims"][0]["claim_id"] == "claim"
+
+
 def test_pending_operation_refuses_claim_and_same_model_force_operation(tmp_path):
     path = tmp_path / "claims.json"
     started = claims.begin_operation("model", "unload", force=True, path=path, now_fn=lambda: _T0)

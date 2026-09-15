@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import math
 import os
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -235,37 +236,42 @@ def _canonical_record(record: dict) -> dict | None:
 
 
 def _claim_view(record: dict) -> dict | None:
-    """Return a complete JSON claim entry, including null reservation fields."""
+    """Return a claim entry, preserving protection when fields are malformed."""
     canonical = _canonical_record(record)
-    if canonical is None or not isinstance(canonical.get("claim_id"), str):
+    if canonical is None:
         return None
-    kind = canonical.get("kind", "model")
-    if kind not in ("model", "reservation"):
-        return None
-    required_text = ("owner", "purpose", "claimed_at", "renewed_at", "expires_at")
-    if any(not isinstance(canonical.get(key), str) for key in required_text):
-        return None
+    kind = "reservation" if canonical.get("kind") == "reservation" else "model"
+    claim_id = canonical.get("claim_id")
+    if not isinstance(claim_id, str) or not claim_id.strip():
+        claim_id = None
+    model = canonical.get("model") if kind == "model" else None
+    text_fields = {
+        key: value if isinstance(value, str) else None
+        for key, value in ((key, canonical.get(key)) for key in (
+            "owner", "purpose", "claimed_at", "renewed_at", "expires_at"))
+    }
     ttl_seconds = canonical.get("ttl_seconds")
     if isinstance(ttl_seconds, bool) or not isinstance(ttl_seconds, int):
-        return None
+        ttl_seconds = None
     gb = canonical.get("gb")
-    if gb is not None and not isinstance(gb, (int, float)):
-        return None
+    if kind != "reservation" or isinstance(gb, bool) or not isinstance(gb, (int, float)):
+        gb = None
+    else:
+        try:
+            gb = float(gb) if math.isfinite(float(gb)) else None
+        except (OverflowError, TypeError, ValueError):
+            gb = None
     pid = canonical.get("pid")
     if pid is not None and (isinstance(pid, bool) or not isinstance(pid, int)):
-        return None
+        pid = None
     return {
-        "claim_id": canonical["claim_id"],
+        "claim_id": claim_id,
         "kind": kind,
-        "model": canonical.get("model") if kind == "model" else None,
-        "gb": float(gb) if kind == "reservation" and gb is not None else None,
+        "model": model,
         "pid": pid,
-        "owner": canonical["owner"],
-        "purpose": canonical["purpose"],
-        "claimed_at": canonical["claimed_at"],
-        "renewed_at": canonical["renewed_at"],
+        "gb": gb,
+        **text_fields,
         "ttl_seconds": ttl_seconds,
-        "expires_at": canonical["expires_at"],
     }
 
 
@@ -274,9 +280,9 @@ def _active_model_claims(data: dict, model: str, now: datetime) -> list[dict]:
     for record in data["claims"]:
         if not _is_active(record, now):
             continue
-        view = _claim_view(record)
-        if view is not None and view["model"] == model:
-            result.append(view)
+        canonical = _canonical_record(record)
+        if canonical is not None and canonical.get("model") == model:
+            result.append(canonical)
     return result
 
 
@@ -510,7 +516,7 @@ def begin_operation(
         if kind in _EVICTION_KINDS and not force and active_claims:
             return {"ok": False, "outcome": "refused", "reason": "model_claimed",
                     "model": model,
-                    "claims": active_claims}
+                    "claims": [_claim_view(record) for record in active_claims]}
         fd = _try_operation_lock(path, model)
         if fd is None:
             return {"ok": False, "outcome": "refused", "reason": "operation_pending",

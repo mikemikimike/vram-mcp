@@ -122,8 +122,10 @@ def _fmt_free(free_mb) -> str:
     return "unknown (nvidia-smi unavailable)" if free_mb is None else f"{free_mb} MB"
 
 
-def _stable_claim_entries(records) -> list[dict]:
+def _stable_claim_entries(records) -> list[dict] | None:
     """Normalize legacy claim records before exposing them through MCP."""
+    if records is None:
+        return None
     entries = []
     for record in records or []:
         entry = _claims._claim_view(record) if isinstance(record, dict) else None
@@ -172,6 +174,9 @@ def _coordination_result(
     normalized.setdefault("headroom_mb", None)
     normalized.setdefault("reserved_mb", None)
     normalized.setdefault("additional_mb", None)
+    normalized.setdefault("scope", None)
+    normalized.setdefault("free_mb", None)
+    normalized.setdefault("coordination_warning", None)
     return normalized
 
 
@@ -274,7 +279,7 @@ def _action_result(
     if _AUDIT_ON:
         _audit.log_action(action=action, target=model, kind="ollama", actor=by,
                           force=force, outcome=result["outcome"],
-                          detail=result.get("detail", result.get("reason", "")),
+                          detail=result.get("detail") or result.get("reason") or "",
                           scope=_ollama.base_url, cap=_EVENT_CAP)
     return result
 
@@ -313,7 +318,7 @@ def _mutate(model: str, kind: str, force: bool, by: str, perform) -> dict:
         return _coordination_result({
             "ok": False, "outcome": "refused", "reason": "coordination_error",
             "detail": str(exc), "summary": f"{kind.capitalize()} refused: {exc}",
-        }, model=None)
+        }, model=model)
 
 
 def _unload_impl(model: str, force: bool, by: str, *, action: str = "unload") -> dict:
@@ -556,6 +561,7 @@ def _renew_impl(claim_id: str, ttl_seconds: Optional[int]) -> dict:
                 "claim_id": claim_id, "expires_at": None}
     result = outcome["result"]
     result.update({"claim_id": claim_id,
+                   "expires_at": result.get("expires_at"),
                    "outcome": "succeeded" if result["ok"] else "refused",
                    "model": None,
                    "reason": None if result["ok"] else "claim_not_active",

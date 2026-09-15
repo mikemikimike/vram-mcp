@@ -39,7 +39,7 @@ class OperationEntry(TypedDict):
     lifecycle: OperationLifecycle
     owner_live: bool
     lease_expired: bool
-    outcome: Outcome | None
+    outcome: Literal["unknown"] | None
     reason: str | None
     retry_count: int
     retry_after: str | None
@@ -101,6 +101,9 @@ class ResidencyResult(CoordinationBase):
     headroom_mb: int | None
     reserved_mb: int | None
     additional_mb: int | None
+    scope: str | None
+    free_mb: int | None
+    coordination_warning: str | None
 
 
 class EnsureFreeResult(CoordinationBase):

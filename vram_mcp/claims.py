@@ -46,8 +46,42 @@ def _operation_scope(record: dict) -> str:
     return nonblank_text(record.get("scope", _DEFAULT_SCOPE), "scope")
 
 
+def _valid_operation(record: object) -> bool:
+    """Check one operation without making the rest of the ledger unusable."""
+    try:
+        if not isinstance(record, dict):
+            raise ValueError
+        nonblank_text(record.get("operation_id"), "operation_id")
+        canonical_model(record.get("model"))
+        nonblank_text(record.get("kind"), "kind")
+        _operation_scope(record)
+        _parse_iso(record["started_at"])
+        expires_at = _parse_iso(record["expires_at"])
+        if expires_at.tzinfo is None:
+            raise ValueError
+        pending_until = record.get("pending_until")
+        if pending_until is not None and not isinstance(pending_until, str):
+            raise ValueError
+        lifecycle = record.get("lifecycle")
+        if lifecycle is not None and lifecycle not in ("in_flight", "unknown"):
+            raise ValueError
+        retry_count = record.get("retry_count", 0)
+        if isinstance(retry_count, bool) or not isinstance(retry_count, int) or retry_count < 0:
+            raise ValueError
+        outcome = record.get("outcome")
+        if outcome is not None and outcome not in ("succeeded", "refused", "failed", "unknown"):
+            raise ValueError
+        for key in ("reason", "retry_after"):
+            value = record.get(key)
+            if value is not None and not isinstance(value, str):
+                raise ValueError
+    except (KeyError, TypeError, ValueError):
+        return False
+    return True
+
+
 def _load(path: Path) -> dict:
-    """Read strictly: a missing ledger is empty; an existing bad one is unsafe."""
+    """Read the ledger, retaining claims when an operation record is bad."""
     try:
         text = path.read_text(encoding="utf-8")
     except FileNotFoundError:
@@ -63,30 +97,7 @@ def _load(path: Path) -> dict:
     operations = data.get("operations", [])
     if not isinstance(operations, list):
         raise ValueError(f"claim ledger has invalid operations: {path}")
-    for record in operations:
-        try:
-            if not isinstance(record, dict):
-                raise ValueError
-            nonblank_text(record.get("operation_id"), "operation_id")
-            canonical_model(record.get("model"))
-            nonblank_text(record.get("kind"), "kind")
-            _operation_scope(record)
-            _parse_iso(record["started_at"])
-            expires_at = _parse_iso(record["expires_at"])
-            if expires_at.tzinfo is None:
-                raise ValueError
-            lifecycle = record.get("lifecycle")
-            if lifecycle is not None and lifecycle not in ("in_flight", "unknown"):
-                raise ValueError
-            retry_count = record.get("retry_count", 0)
-            if isinstance(retry_count, bool) or not isinstance(retry_count, int) or retry_count < 0:
-                raise ValueError
-            outcome = record.get("outcome")
-            if outcome is not None and outcome not in ("succeeded", "refused", "failed", "unknown"):
-                raise ValueError
-        except (KeyError, TypeError, ValueError):
-            raise ValueError(f"claim ledger has malformed operation: {path}")
-    data.setdefault("operations", operations)
+    data["operations"] = [record for record in operations if _valid_operation(record)]
     return data
 
 
@@ -153,12 +164,11 @@ def _operation_view(path: Path, record: dict, now: datetime) -> dict:
     outcome = record.get("outcome")
     if lifecycle == "unknown":
         outcome = "unknown"
-    elif outcome not in (None, "succeeded", "refused", "failed", "unknown"):
+    else:
         outcome = None
     retry_count = record.get("retry_count", 0)
     if isinstance(retry_count, bool) or not isinstance(retry_count, int) or retry_count < 0:
         retry_count = 0
-    retry_after = record.get("retry_after")
     if lifecycle == "unknown":
         retry_after = pending_until
     else:
@@ -186,10 +196,30 @@ def _prune_expired(data: dict, now: datetime, path: Path) -> None:
     # An elapsed wall-clock lease does not evict a still-live operation owner.
     # The per-operation OS lock proves liveness across processes; an absent lock
     # means a crashed holder's bounded lease is safe to discard.
-    data["operations"] = [
-        r for r in data["operations"]
-        if _is_active(r, now) or _operation_is_live(path, r)
-    ]
+    expired = []
+    retained = []
+    for record in data["operations"]:
+        if _is_active(record, now) or _operation_is_live(path, record):
+            retained.append(record)
+        else:
+            expired.append(record)
+    data["operations"] = retained
+    retry_counts = data.setdefault("operation_retry_counts", {})
+    if not isinstance(retry_counts, dict):
+        retry_counts = {}
+        data["operation_retry_counts"] = retry_counts
+    for record in expired:
+        try:
+            model = canonical_model(record["model"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        count = record.get("retry_count", 0)
+        if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+            count = 0
+        previous = retry_counts.get(model, 0)
+        if isinstance(previous, bool) or not isinstance(previous, int) or previous < 0:
+            previous = 0
+        retry_counts[model] = max(previous, count + 1)
 
 
 def _canonical_record(record: dict) -> dict | None:
@@ -244,9 +274,9 @@ def _active_model_claims(data: dict, model: str, now: datetime) -> list[dict]:
     for record in data["claims"]:
         if not _is_active(record, now):
             continue
-        canonical = _canonical_record(record)
-        if canonical is not None and canonical.get("model") == model:
-            result.append(canonical)
+        view = _claim_view(record)
+        if view is not None and view["model"] == model:
+            result.append(view)
     return result
 
 
@@ -460,6 +490,12 @@ def begin_operation(
     with _locked(path):
         data = _load(path)
         _prune_expired(data, now, path)
+        retry_counts = data.get("operation_retry_counts", {})
+        if not isinstance(retry_counts, dict):
+            retry_counts = {}
+        retry_count = retry_counts.get(model, 0)
+        if isinstance(retry_count, bool) or not isinstance(retry_count, int) or retry_count < 0:
+            retry_count = 0
         pending = _pending_for(data, model, now)
         if pending:
             return {"ok": False, "outcome": "refused", "reason": "operation_pending",
@@ -474,8 +510,7 @@ def begin_operation(
         if kind in _EVICTION_KINDS and not force and active_claims:
             return {"ok": False, "outcome": "refused", "reason": "model_claimed",
                     "model": model,
-                    "claims": [_claim_view(record) for record in active_claims
-                               if _claim_view(record) is not None]}
+                    "claims": active_claims}
         fd = _try_operation_lock(path, model)
         if fd is None:
             return {"ok": False, "outcome": "refused", "reason": "operation_pending",
@@ -486,7 +521,8 @@ def begin_operation(
             record = {"operation_id": operation_id, "model": model, "kind": kind,
                       "scope": scope, "started_at": _iso(now), "expires_at": _iso(expires_at),
                       "pending_until": _iso(expires_at), "lifecycle": "in_flight",
-                      "outcome": None, "reason": None, "retry_count": 0,
+                      "outcome": None, "reason": None,
+                      "retry_count": retry_count,
                       "retry_after": None}
             data["operations"].append(record)
             _save(path, data)
@@ -513,12 +549,21 @@ def finish_operation(
     now = now_fn()
     expires_at = None
     found = False
+    operation_model = None
     try:
         with _locked(path):
             data = _load(path)
             _prune_expired(data, now, path)
             found = any(isinstance(r, dict) and r.get("operation_id") == operation_id
                         for r in data["operations"])
+            if found:
+                for record in data["operations"]:
+                    if isinstance(record, dict) and record.get("operation_id") == operation_id:
+                        try:
+                            operation_model = canonical_model(record.get("model"))
+                        except (TypeError, ValueError):
+                            operation_model = None
+                        break
             if found and uncertain:
                 expires_at = _iso(_expires_at(now, _OPERATION_LEASE_SECONDS))
                 for record in data["operations"]:
@@ -537,7 +582,12 @@ def finish_operation(
                     r for r in data["operations"]
                     if not (isinstance(r, dict) and r.get("operation_id") == operation_id)
                 ]
+                if operation_model is not None:
+                    data.setdefault("operation_retry_counts", {}).pop(operation_model, None)
                 _save(path, data)
+            fd = _OPERATION_LOCKS.pop(operation_id, None)
+            if fd is not None:
+                _release_operation_lock(fd)
     finally:
         fd = _OPERATION_LOCKS.pop(operation_id, None)
         if fd is not None:

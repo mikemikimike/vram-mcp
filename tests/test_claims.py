@@ -463,11 +463,21 @@ def test_uncertain_operation_releases_owner_lock_but_renews_durable_grace(tmp_pa
 
 @pytest.mark.parametrize("operation", ["bad", {"operation_id": "op"},
                                          {"operation_id": "op", "model": "model"}])
-def test_malformed_existing_operation_fails_closed(tmp_path, operation):
+def test_malformed_existing_operation_is_discarded_without_losing_claims(tmp_path, operation):
     path = tmp_path / "claims.json"
-    path.write_text(json.dumps({"claims": [], "operations": [operation]}), encoding="utf-8")
-    with pytest.raises(ValueError, match="malformed operation"):
-        claims.begin_operation("model", "unload", path=path, now_fn=lambda: _T0)
+    valid_claim = {
+        "claim_id": "claim", "model": "model:latest", "owner": "owner",
+        "purpose": "purpose", "claimed_at": "2026-07-13T18:00:00Z",
+        "renewed_at": "2026-07-13T18:00:00Z", "ttl_seconds": 3600,
+        "expires_at": "2026-07-13T19:00:00Z",
+    }
+    path.write_text(json.dumps({"claims": [valid_claim], "operations": [operation]}), encoding="utf-8")
+    assert [r["claim_id"] for r in claims.list_claims(path=path, now_fn=lambda: _T0)] == ["claim"]
+    started = claims.begin_operation("model", "unload", force=True, path=path, now_fn=lambda: _T0)
+    claims.finish_operation(started["operation_id"], path=path, now_fn=lambda: _T0)
+    on_disk = json.loads(path.read_text(encoding="utf-8"))
+    assert on_disk["operations"] == []
+    assert [r["claim_id"] for r in on_disk["claims"]] == ["claim"]
 
 
 def test_warm_operations_serialize_capacity_admission_by_scope(tmp_path):
@@ -555,3 +565,21 @@ def test_list_coordination_reports_unknown_until_refreshed_expiry(tmp_path):
 
     clock.tick(claims._OPERATION_LEASE_SECONDS + 1)
     assert claims.list_coordination(path=path, now_fn=clock)["operations"] == []
+
+
+def test_retry_count_survives_expiry_and_list_pruning(tmp_path):
+    path = tmp_path / "claims.json"
+    clock = _clock(_T0)
+    first = claims.begin_operation("model", "unload", force=True, path=path, now_fn=clock)
+    claims.finish_operation(first["operation_id"], uncertain=True, path=path, now_fn=clock)
+    clock.tick(claims._OPERATION_LEASE_SECONDS + 1)
+
+    # A polling read may prune the old unknown record before the retry starts.
+    assert claims.list_coordination(path=path, now_fn=clock)["operations"] == []
+    second = claims.begin_operation("model", "unload", force=True, path=path, now_fn=clock)
+    try:
+        assert second["ok"] is True
+        on_disk = json.loads(path.read_text(encoding="utf-8"))
+        assert on_disk["operations"][0]["retry_count"] == 1
+    finally:
+        claims.finish_operation(second["operation_id"], path=path, now_fn=clock)

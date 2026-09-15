@@ -14,11 +14,13 @@ same OS user coordinate through `~/.cache/vram-mcp/`:
 | `last_seen.json` | Previous set of observed memory holders. |
 | `last_sample.json` | Shared sampling throttle state. |
 
-Ledger writes use file locks and atomic replacement. An existing unreadable or
-invalid ledger is treated as unavailable, because silently replacing it could
-discard another session's protection. Owners are descriptive labels, not
-authenticated identities. Separate home directories have separate ledgers,
-even when their processes use the same physical GPU.
+Ledger writes use file locks and atomic replacement. An unreadable or
+wrong-shaped ledger is treated as unavailable, because silently replacing it
+could discard another session's protection. An individual malformed operation
+record is discarded while valid claims are retained, and the next ledger write
+removes it permanently. Owners are descriptive labels, not authenticated
+identities. Separate home directories have separate ledgers, even when their
+processes use the same physical GPU.
 
 ## Model claims
 
@@ -89,8 +91,9 @@ An operation with `owner_live=true` continues to block the same-model mutation
 even when `lease_expired=true`. A lease is safe to discard only when its owner
 lock is no longer held. An unknown operation has `owner_live=false` and remains
 visible until `pending_until`; it blocks a retry during that window. The list
-call refreshes the view from disk, so a renewed pending expiry is returned
-exactly as stored.
+call takes the ledger lock, refreshes the view from disk, and rewrites the file
+when pruning changes it, so a renewed pending expiry is returned exactly as
+stored. Polling therefore briefly serializes with ledger writers.
 
 ### Interpreting a warm result
 

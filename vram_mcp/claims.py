@@ -53,7 +53,10 @@ def _valid_operation(record: object) -> bool:
         if not isinstance(record, dict):
             raise ValueError
         nonblank_text(record.get("operation_id"), "operation_id")
-        canonical_model(record.get("model"))
+        model = record.get("model")
+        if not isinstance(model, str):
+            raise ValueError
+        canonical_model(model)
         nonblank_text(record.get("kind"), "kind")
         _operation_scope(record)
         _parse_iso(record["started_at"])
@@ -161,7 +164,9 @@ def _operation_view(path: Path, record: dict, now: datetime) -> dict:
     lifecycle = record.get("lifecycle")
     if lifecycle not in ("in_flight", "unknown"):
         lifecycle = "in_flight"
-    pending_until = record.get("pending_until", record["expires_at"])
+    pending_until = record.get("pending_until")
+    if not isinstance(pending_until, str) or not pending_until.strip():
+        pending_until = record["expires_at"]
     outcome = record.get("outcome")
     if lifecycle == "unknown":
         outcome = "unknown"
@@ -565,10 +570,12 @@ def finish_operation(
             if found:
                 for record in data["operations"]:
                     if isinstance(record, dict) and record.get("operation_id") == operation_id:
-                        try:
-                            operation_model = canonical_model(record.get("model"))
-                        except (TypeError, ValueError):
-                            operation_model = None
+                        model = record.get("model")
+                        if isinstance(model, str):
+                            try:
+                                operation_model = canonical_model(model)
+                            except ValueError:
+                                operation_model = None
                         break
             if found and uncertain:
                 expires_at = _iso(_expires_at(now, _OPERATION_LEASE_SECONDS))

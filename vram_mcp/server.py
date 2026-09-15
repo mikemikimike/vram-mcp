@@ -294,15 +294,18 @@ def _mutate(model: str, kind: str, force: bool, by: str, perform) -> dict:
             return _action_result(kind, model, by, force, slot)
         operation_id = slot["operation_id"]
         result = {"ok": False, "outcome": "unknown", "detail": "Operation interrupted"}
+        result_reason: Optional[str] = None
         try:
             result = perform(model)
+            reason_value = result.get("reason")
+            result_reason = reason_value if isinstance(reason_value, str) else None
         except (ValueError, OSError, TimeoutError) as exc:
             result = {"ok": False, "outcome": "refused", "detail": str(exc)}
         finally:
             try:
                 finished = _claims.finish_operation(
                     operation_id, uncertain=result["outcome"] == "unknown",
-                    reason=result.get("reason"),
+                    reason=result_reason,
                 )
                 slot["expires_at"] = finished.get("expires_at", slot["expires_at"])
             except (ValueError, OSError, TimeoutError) as exc:
@@ -310,9 +313,12 @@ def _mutate(model: str, kind: str, force: bool, by: str, perform) -> dict:
         if result["outcome"] == "unknown":
             result["pending_until"] = slot["expires_at"]
             result["retry_after"] = slot["expires_at"]
+        pending_until = result.get("pending_until")
+        if not isinstance(pending_until, str):
+            pending_until = None
         return _action_result(
             kind, model, by, force, result, operation_id=operation_id,
-            pending_until=result.get("pending_until"),
+            pending_until=pending_until,
         )
     except (ValueError, OSError, TimeoutError) as exc:
         return _coordination_result({

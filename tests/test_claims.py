@@ -584,6 +584,19 @@ def test_list_coordination_reports_unknown_until_refreshed_expiry(tmp_path):
     assert claims.list_coordination(path=path, now_fn=clock)["operations"] == []
 
 
+def test_list_coordination_defaults_missing_pending_boundary(tmp_path):
+    path = tmp_path / "claims.json"
+    expires = "2026-07-13T18:02:00Z"
+    path.write_text(json.dumps({"claims": [], "operations": [{
+        "operation_id": "op", "model": "model:latest", "kind": "unload",
+        "started_at": "2026-07-13T18:00:00Z", "expires_at": expires,
+        "pending_until": None,
+    }]}), encoding="utf-8")
+
+    [operation] = claims.list_coordination(path=path, now_fn=lambda: _T0)["operations"]
+    assert operation["pending_until"] == expires
+
+
 def test_retry_count_survives_expiry_and_list_pruning(tmp_path):
     path = tmp_path / "claims.json"
     clock = _clock(_T0)

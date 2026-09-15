@@ -193,15 +193,20 @@ class _SchemaBackend:
 
 def _validate_tool_output(name, result):
     tool = server.mcp._tool_manager.get_tool(name)
-    assert tool.fn_metadata.output_schema is not None
-    return tool.fn_metadata.output_model.model_validate(result)
+    assert tool is not None
+    metadata = tool.fn_metadata
+    assert metadata.output_schema is not None
+    assert metadata.output_model is not None
+    return metadata.output_model.model_validate(result)
 
 
 def test_coordination_tools_publish_and_validate_stable_outputs(monkeypatch):
     names = ["claim", "reserve", "renew", "release", "list_claims",
              "unload", "warm", "ensure_free"]
     for name in names:
-        assert server.mcp._tool_manager.get_tool(name).fn_metadata.output_schema is not None
+        tool = server.mcp._tool_manager.get_tool(name)
+        assert tool is not None
+        assert tool.fn_metadata.output_schema is not None
 
     monkeypatch.setattr(server, "_ollama", _SchemaBackend("succeeded"))
     success = server._unload_impl("success", True, "tester")

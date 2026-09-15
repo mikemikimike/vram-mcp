@@ -13,18 +13,21 @@ from vram_mcp import _util, claims
 _T0 = datetime(2026, 7, 13, 18, 0, 0, tzinfo=timezone.utc)
 
 
-def _clock(start):
+class _Clock:
     """A controllable now_fn: starts at `start`, advances via .tick(seconds)."""
-    state = {"now": start}
 
-    def now_fn():
-        return state["now"]
+    def __init__(self, start: datetime) -> None:
+        self.now = start
 
-    def tick(seconds):
-        state["now"] = state["now"] + timedelta(seconds=seconds)
+    def __call__(self) -> datetime:
+        return self.now
 
-    now_fn.tick = tick
-    return now_fn
+    def tick(self, seconds: int) -> None:
+        self.now += timedelta(seconds=seconds)
+
+
+def _clock(start: datetime) -> _Clock:
+    return _Clock(start)
 
 
 def test_claim_creates_and_list_claims_returns_it(tmp_path):

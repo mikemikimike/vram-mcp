@@ -20,7 +20,7 @@ import math
 import re
 
 from datetime import datetime, timedelta, timezone
-from typing import Optional
+from typing import Any, Optional, get_args, get_origin, get_type_hints
 
 import anyio.to_thread
 from mcp.server.fastmcp import FastMCP
@@ -134,49 +134,69 @@ def _stable_claim_entries(records) -> list[dict] | None:
     return entries
 
 
-def _coordination_result(
-    result: dict | None = None, *, model: str | None = None,
-    operation_id: str | None = None, pending_until: str | None = None,
-    retry_count: int = 0,
-) -> dict:
-    """Fill the common mutation contract without discarding tool fields."""
+def _as_boundary(value) -> str | None:
+    """A retry boundary is a non-blank ISO timestamp, or it is absent.
+
+    Ledger records are shared across versions and processes, so a boundary can
+    arrive as any JSON type. Narrowing here keeps a bad one out of ``max()``
+    and out of a caller's retry arithmetic, rather than letting it become a
+    time that sorts strangely or crashes the comparison.
+    """
+    return value if isinstance(value, str) and value.strip() else None
+
+
+def _empty_for(annotation) -> Any:
+    """The empty value a declared field type implies.
+
+    Optionality is tested first, so ``list[X] | None`` fills as ``null`` rather
+    than ``[]``: "this field does not apply here" and "it applies and is empty"
+    are different answers, and callers branch on the difference.
+    """
+    if type(None) in get_args(annotation):
+        return None
+    return {bool: False, int: 0, float: 0.0, str: "",
+            list: [], dict: {}}.get(get_origin(annotation) or annotation)
+
+
+def _coordination_result(schema: type, result: dict | None = None, **overrides) -> dict:
+    """Project a tool's raw result onto exactly the fields ``schema`` declares.
+
+    The schema is the single source of truth for the shape. Every declared
+    field is present — filled from the producer, an override, or the empty
+    value its type implies — so a field can never be added to a schema and
+    forgotten here, and two sibling schemas cannot silently drift apart.
+
+    The reverse direction matters just as much and is not enforceable from
+    inside this function: FastMCP validates against the schema and DROPS any
+    key it does not declare, silently. A producer that emits an undeclared
+    field therefore loses it in transit. ``tests/test_schema_contract.py``
+    asserts the two key sets are equal, not merely compatible, so that class
+    of loss fails a test instead of reaching an agent.
+
+    An override of ``None`` defers to whatever the producer supplied; a
+    non-``None`` override wins, since the caller knows the operation it just
+    performed better than the dict it is normalizing.
+    """
     normalized = dict(result or {})
-    if model is not None:
-        normalized["model"] = model
-    else:
-        normalized.setdefault("model", None)
+    for key, value in overrides.items():
+        if value is not None or key not in normalized:
+            normalized[key] = value
     normalized.setdefault("ok", False)
-    normalized.setdefault("outcome", "refused" if not normalized["ok"] else "succeeded")
-    normalized.setdefault("reason", None)
-    if normalized["outcome"] == "unknown" and normalized["reason"] is None:
-        normalized["reason"] = "outcome_unknown"
-    normalized.setdefault("detail", None)
-    normalized.setdefault("operation_id", operation_id)
-    normalized.setdefault("pending_until", pending_until)
-    if normalized["outcome"] == "unknown" and normalized.get("retry_after") is None:
-        normalized["retry_after"] = normalized.get("pending_until")
-    else:
-        normalized.setdefault("retry_after", None)
-    normalized.setdefault("retry_count", retry_count)
-    normalized["claims"] = (_stable_claim_entries(normalized["claims"])
-                             if "claims" in normalized else None)
-    normalized["reservations"] = (_stable_claim_entries(normalized["reservations"])
-                                   if "reservations" in normalized else None)
-    normalized.setdefault("operations", None)
-    normalized.setdefault("observations", None)
-    normalized.setdefault("keep_alive", None)
-    normalized.setdefault("resident", None)
-    normalized.setdefault("protected", None)
-    normalized.setdefault("busy", None)
-    normalized.setdefault("refused", None)
-    normalized.setdefault("size_verified", None)
-    normalized.setdefault("model_size_mb", None)
-    normalized.setdefault("headroom_mb", None)
-    normalized.setdefault("reserved_mb", None)
-    normalized.setdefault("additional_mb", None)
-    normalized.setdefault("scope", None)
-    normalized.setdefault("free_mb", None)
-    normalized.setdefault("coordination_warning", None)
+    normalized.setdefault("outcome", "succeeded" if normalized["ok"] else "refused")
+    if normalized["outcome"] == "unknown":
+        # An unverified outcome must always say why it could not be confirmed.
+        normalized["reason"] = normalized.get("reason") or "outcome_unknown"
+    if normalized.get("pending_until") and not normalized.get("retry_after"):
+        # A stated boundary is a retry time whichever outcome produced it, so
+        # "when may I try again" has one answer at the top level rather than
+        # living in `operations[]` for refusals and here for unknowns.
+        normalized["retry_after"] = normalized["pending_until"]
+    for field in ("claims", "reservations"):
+        if field in normalized:
+            normalized[field] = _stable_claim_entries(normalized[field])
+    for field, annotation in get_type_hints(schema).items():
+        if field not in normalized:
+            normalized[field] = _empty_for(annotation)
     return normalized
 
 
@@ -271,11 +291,14 @@ def _action_result(
     retry_count: int = 0,
 ) -> dict:
     result = _coordination_result(
-        result, model=model, operation_id=operation_id,
+        ResidencyResult, result, model=model, operation_id=operation_id,
         pending_until=pending_until, retry_count=retry_count,
     )
-    result.setdefault("summary", f"{action.capitalize()} '{model}': {result['outcome']}. "
-                      + (result.get("detail") or result.get("reason") or ""))
+    # The schema fills an absent summary with "", so test truthiness rather
+    # than presence — an empty summary is as useless to a caller as none.
+    if not result["summary"]:
+        result["summary"] = (f"{action.capitalize()} '{model}': {result['outcome']}. "
+                             + (result.get("detail") or result.get("reason") or ""))
     if _AUDIT_ON:
         _audit.log_action(action=action, target=model, kind="ollama", actor=by,
                           force=force, outcome=result["outcome"],
@@ -291,7 +314,16 @@ def _mutate(model: str, kind: str, force: bool, by: str, perform) -> dict:
         by = nonblank_text(by, "by")
         slot = _claims.begin_operation(model, kind, force, scope=f"gpu:index={_GPU_INDEX}")
         if not slot["ok"]:
-            return _action_result(kind, model, by, force, slot)
+            # Lift the blocking lease's boundary to the top level; the caller
+            # asked when it may retry, not which record happens to hold it.
+            blocking = slot.get("operations") or []
+            return _action_result(
+                kind, model, by, force, slot,
+                pending_until=max(
+                    filter(None, (_as_boundary(op.get("pending_until"))
+                                  for op in blocking)),
+                    default=None),
+            )
         operation_id = slot["operation_id"]
         result = {"ok": False, "outcome": "unknown", "detail": "Operation interrupted"}
         result_reason: Optional[str] = None
@@ -313,15 +345,13 @@ def _mutate(model: str, kind: str, force: bool, by: str, perform) -> dict:
         if result["outcome"] == "unknown":
             result["pending_until"] = slot["expires_at"]
             result["retry_after"] = slot["expires_at"]
-        pending_until = result.get("pending_until")
-        if not isinstance(pending_until, str):
-            pending_until = None
         return _action_result(
             kind, model, by, force, result, operation_id=operation_id,
-            pending_until=pending_until,
+            pending_until=_as_boundary(result.get("pending_until")),
+            retry_count=slot["retry_count"],
         )
     except (ValueError, OSError, TimeoutError) as exc:
-        return _coordination_result({
+        return _coordination_result(ResidencyResult, {
             "ok": False, "outcome": "refused", "reason": "coordination_error",
             "detail": str(exc), "summary": f"{kind.capitalize()} refused: {exc}",
         }, model=model)
@@ -379,19 +409,29 @@ def _ensure_free_impl(gb: float, force: bool, by: str) -> dict:
 
 
 def _ensure_free_result(result: dict) -> dict:
-    """Normalize ensure_free while retaining its attempt-level details."""
-    normalized = _coordination_result(result)
-    normalized["already_free"] = result.get("already_free", False)
-    normalized["free_mb"] = result.get("free_mb")
-    normalized["unloaded"] = result.get("unloaded", [])
-    normalized["declined"] = result.get("declined", [])
-    normalized["attempts"] = [
-        _coordination_result(attempt, model=attempt.get("model"))
+    """Normalize ensure_free, projecting each eviction attempt onto its own schema.
+
+    Every scalar and collection ensure_free reports is declared on
+    ``EnsureFreeResult``, so the projection supplies them; ``attempts`` needs
+    naming because its entries are ``ResidencyResult`` and must be projected
+    against that shape rather than this one.
+
+    The batch's retry boundary is the latest one blocking any of its attempts.
+    ensure_free begins no operation of its own, so without lifting it the top
+    level would report "nothing pending" while an eviction inside it was
+    blocked until a lease lapsed — the caller would be told to retry
+    immediately, and be refused again.
+    """
+    attempts = [
+        _coordination_result(ResidencyResult, attempt, model=attempt.get("model"))
         for attempt in result.get("attempts", []) if isinstance(attempt, dict)
     ]
-    normalized["target_mb"] = result.get("target_mb")
-    normalized["reserved_mb"] = result.get("reserved_mb")
-    normalized["observations"] = result.get("observations", {})
+    normalized = _coordination_result(
+        EnsureFreeResult, result,
+        pending_until=max(filter(None, (_as_boundary(attempt["pending_until"])
+                                        for attempt in attempts)), default=None),
+    )
+    normalized["attempts"] = attempts
     return normalized
 
 
@@ -408,11 +448,11 @@ async def ensure_free(gb: float, force: bool = False, by: str = "unknown") -> En
 def _warm_impl(model: str, keep_alive: str, by: str, force: bool) -> dict:
     # A zero duration is an eviction and must go through unload protection.
     if not isinstance(keep_alive, str) or not re.fullmatch(r"(?:-1|(?:[0-9]+(?:\.[0-9]+)?(?:ns|us|ms|s|m|h))+)", keep_alive) or not any(c in "123456789" for c in keep_alive):
-        return _coordination_result({
+        return _coordination_result(ResidencyResult, {
             "ok": False, "outcome": "refused", "reason": "invalid_keep_alive",
             "detail": "keep_alive must be a positive duration (e.g. 5m) or -1; use unload() to evict",
             "summary": "keep_alive must be a positive duration (e.g. 5m) or -1; use unload() to evict",
-        })
+        }, model=model)
 
     def perform(name):
         admission = None

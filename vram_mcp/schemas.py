@@ -108,10 +108,12 @@ class ResidencyResult(CoordinationBase):
 
 
 class EnsureFreeResult(CoordinationBase):
-    operation_id: str | None
+    # No `operation_id` or `retry_count`: ensure_free is a batch that delegates
+    # each eviction to its own operation, so those describe an `attempts` entry
+    # and were only ever reportable as a constant here. The retry BOUNDARY does
+    # generalize — see _ensure_free_result, which lifts it from the attempts.
     pending_until: str | None
     retry_after: str | None
-    retry_count: int
     already_free: bool
     free_mb: int | None
     unloaded: list[str]

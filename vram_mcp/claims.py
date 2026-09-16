@@ -541,8 +541,11 @@ def begin_operation(
         except Exception:
             _release_operation_lock(fd)
             raise
+    # retry_count comes from the record just written, not recomputed: the lease
+    # a caller is told about and the one on disk must not be able to disagree.
     return {"ok": True, "outcome": "begun", "operation_id": operation_id,
-            "model": model, "kind": kind, "scope": scope, "expires_at": record["expires_at"]}
+            "model": model, "kind": kind, "scope": scope,
+            "expires_at": record["expires_at"], "retry_count": record["retry_count"]}
 
 
 def finish_operation(

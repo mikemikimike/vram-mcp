@@ -35,6 +35,10 @@ from .observations import Observation
 from .validation import nonblank_text
 from .ollama import OllamaClient
 from .ollama_correlate import runner_pid_map
+from .schemas import (
+    ClaimResult, EnsureFreeResult, ListClaimsResult, ReleaseResult,
+    RenewResult, ReserveResult, ResidencyResult,
+)
 
 mcp = FastMCP("vram-mcp")
 
@@ -116,6 +120,64 @@ def _run_detection(status: dict) -> None:
 
 def _fmt_free(free_mb) -> str:
     return "unknown (nvidia-smi unavailable)" if free_mb is None else f"{free_mb} MB"
+
+
+def _stable_claim_entries(records) -> list[dict] | None:
+    """Normalize legacy claim records before exposing them through MCP."""
+    if records is None:
+        return None
+    entries = []
+    for record in records or []:
+        entry = _claims._claim_view(record) if isinstance(record, dict) else None
+        if entry is not None:
+            entries.append(entry)
+    return entries
+
+
+def _coordination_result(
+    result: dict | None = None, *, model: str | None = None,
+    operation_id: str | None = None, pending_until: str | None = None,
+    retry_count: int = 0,
+) -> dict:
+    """Fill the common mutation contract without discarding tool fields."""
+    normalized = dict(result or {})
+    if model is not None:
+        normalized["model"] = model
+    else:
+        normalized.setdefault("model", None)
+    normalized.setdefault("ok", False)
+    normalized.setdefault("outcome", "refused" if not normalized["ok"] else "succeeded")
+    normalized.setdefault("reason", None)
+    if normalized["outcome"] == "unknown" and normalized["reason"] is None:
+        normalized["reason"] = "outcome_unknown"
+    normalized.setdefault("detail", None)
+    normalized.setdefault("operation_id", operation_id)
+    normalized.setdefault("pending_until", pending_until)
+    if normalized["outcome"] == "unknown" and normalized.get("retry_after") is None:
+        normalized["retry_after"] = normalized.get("pending_until")
+    else:
+        normalized.setdefault("retry_after", None)
+    normalized.setdefault("retry_count", retry_count)
+    normalized["claims"] = (_stable_claim_entries(normalized["claims"])
+                             if "claims" in normalized else None)
+    normalized["reservations"] = (_stable_claim_entries(normalized["reservations"])
+                                   if "reservations" in normalized else None)
+    normalized.setdefault("operations", None)
+    normalized.setdefault("observations", None)
+    normalized.setdefault("keep_alive", None)
+    normalized.setdefault("resident", None)
+    normalized.setdefault("protected", None)
+    normalized.setdefault("busy", None)
+    normalized.setdefault("refused", None)
+    normalized.setdefault("size_verified", None)
+    normalized.setdefault("model_size_mb", None)
+    normalized.setdefault("headroom_mb", None)
+    normalized.setdefault("reserved_mb", None)
+    normalized.setdefault("additional_mb", None)
+    normalized.setdefault("scope", None)
+    normalized.setdefault("free_mb", None)
+    normalized.setdefault("coordination_warning", None)
+    return normalized
 
 
 def _snapshot() -> core.Snapshot:
@@ -203,14 +265,21 @@ async def list_loaded() -> dict:
 
 # ── eviction tools ───────────────────────────────────────────────────────────
 
-def _action_result(action: str, model: str, by: str, force: bool, result: dict) -> dict:
-    result = {**result, "model": model}
+def _action_result(
+    action: str, model: str, by: str, force: bool, result: dict, *,
+    operation_id: str | None = None, pending_until: str | None = None,
+    retry_count: int = 0,
+) -> dict:
+    result = _coordination_result(
+        result, model=model, operation_id=operation_id,
+        pending_until=pending_until, retry_count=retry_count,
+    )
     result.setdefault("summary", f"{action.capitalize()} '{model}': {result['outcome']}. "
-                      + result.get("detail", result.get("reason", "")))
+                      + (result.get("detail") or result.get("reason") or ""))
     if _AUDIT_ON:
         _audit.log_action(action=action, target=model, kind="ollama", actor=by,
                           force=force, outcome=result["outcome"],
-                          detail=result.get("detail", result.get("reason", "")),
+                          detail=result.get("detail") or result.get("reason") or "",
                           scope=_ollama.base_url, cap=_EVENT_CAP)
     return result
 
@@ -223,23 +292,39 @@ def _mutate(model: str, kind: str, force: bool, by: str, perform) -> dict:
         slot = _claims.begin_operation(model, kind, force, scope=f"gpu:index={_GPU_INDEX}")
         if not slot["ok"]:
             return _action_result(kind, model, by, force, slot)
+        operation_id = slot["operation_id"]
         result = {"ok": False, "outcome": "unknown", "detail": "Operation interrupted"}
+        result_reason: Optional[str] = None
         try:
             result = perform(model)
+            reason_value = result.get("reason")
+            result_reason = reason_value if isinstance(reason_value, str) else None
         except (ValueError, OSError, TimeoutError) as exc:
             result = {"ok": False, "outcome": "refused", "detail": str(exc)}
         finally:
             try:
-                finished = _claims.finish_operation(slot["operation_id"], uncertain=result["outcome"] == "unknown")
+                finished = _claims.finish_operation(
+                    operation_id, uncertain=result["outcome"] == "unknown",
+                    reason=result_reason,
+                )
                 slot["expires_at"] = finished.get("expires_at", slot["expires_at"])
             except (ValueError, OSError, TimeoutError) as exc:
                 result["coordination_warning"] = f"Operation slot cleanup failed: {exc}"
         if result["outcome"] == "unknown":
             result["pending_until"] = slot["expires_at"]
-        return _action_result(kind, model, by, force, result)
+            result["retry_after"] = slot["expires_at"]
+        pending_until = result.get("pending_until")
+        if not isinstance(pending_until, str):
+            pending_until = None
+        return _action_result(
+            kind, model, by, force, result, operation_id=operation_id,
+            pending_until=pending_until,
+        )
     except (ValueError, OSError, TimeoutError) as exc:
-        return {"ok": False, "outcome": "refused", "model": model,
-                "summary": f"{kind.capitalize()} refused: {exc}"}
+        return _coordination_result({
+            "ok": False, "outcome": "refused", "reason": "coordination_error",
+            "detail": str(exc), "summary": f"{kind.capitalize()} refused: {exc}",
+        }, model=model)
 
 
 def _unload_impl(model: str, force: bool, by: str, *, action: str = "unload") -> dict:
@@ -254,7 +339,7 @@ def _unload_impl(model: str, force: bool, by: str, *, action: str = "unload") ->
 
 
 @mcp.tool()
-async def unload(model: str, force: bool = False, by: str = "unknown") -> dict:
+async def unload(model: str, force: bool = False, by: str = "unknown") -> ResidencyResult:
     """Evict a single model from VRAM now (Ollama ``keep_alive=0``).
 
     Refuses by default if ``model`` has an active claim or a best-effort busy
@@ -272,7 +357,10 @@ def _ensure_free_impl(gb: float, force: bool, by: str) -> dict:
             evict_fn=lambda name: _unload_impl(name, force, by, action="ensure_free"),
         )
     except (ValueError, OSError, TimeoutError) as exc:
-        return {"ok": False, "outcome": "refused", "summary": f"Ensure free refused: {exc}"}
+        return _ensure_free_result({
+            "ok": False, "outcome": "refused", "reason": "coordination_error",
+            "detail": str(exc), "summary": f"Ensure free refused: {exc}",
+        })
     active, ledger_ok = _active_claims()
     result["reserved_mb"] = core.reserved_mb(active) if ledger_ok else None
     result["summary"] = (
@@ -287,11 +375,28 @@ def _ensure_free_impl(gb: float, force: bool, by: str) -> dict:
         result["summary"] += " Reserved capacity is unknown."
     elif result["reserved_mb"]:
         result["summary"] += f" {result['reserved_mb']} MB is reserved by other sessions."
-    return result
+    return _ensure_free_result(result)
+
+
+def _ensure_free_result(result: dict) -> dict:
+    """Normalize ensure_free while retaining its attempt-level details."""
+    normalized = _coordination_result(result)
+    normalized["already_free"] = result.get("already_free", False)
+    normalized["free_mb"] = result.get("free_mb")
+    normalized["unloaded"] = result.get("unloaded", [])
+    normalized["declined"] = result.get("declined", [])
+    normalized["attempts"] = [
+        _coordination_result(attempt, model=attempt.get("model"))
+        for attempt in result.get("attempts", []) if isinstance(attempt, dict)
+    ]
+    normalized["target_mb"] = result.get("target_mb")
+    normalized["reserved_mb"] = result.get("reserved_mb")
+    normalized["observations"] = result.get("observations", {})
+    return normalized
 
 
 @mcp.tool()
-async def ensure_free(gb: float, force: bool = False, by: str = "unknown") -> dict:
+async def ensure_free(gb: float, force: bool = False, by: str = "unknown") -> EnsureFreeResult:
     """Free VRAM until at least ``gb`` GB is available. Skips claimed/busy models
     unless ``force=True``. ``by`` records the requester in the audit log.
 
@@ -303,7 +408,11 @@ async def ensure_free(gb: float, force: bool = False, by: str = "unknown") -> di
 def _warm_impl(model: str, keep_alive: str, by: str, force: bool) -> dict:
     # A zero duration is an eviction and must go through unload protection.
     if not isinstance(keep_alive, str) or not re.fullmatch(r"(?:-1|(?:[0-9]+(?:\.[0-9]+)?(?:ns|us|ms|s|m|h))+)", keep_alive) or not any(c in "123456789" for c in keep_alive):
-        return {"ok": False, "outcome": "refused", "summary": "keep_alive must be a positive duration (e.g. 5m) or -1; use unload() to evict"}
+        return _coordination_result({
+            "ok": False, "outcome": "refused", "reason": "invalid_keep_alive",
+            "detail": "keep_alive must be a positive duration (e.g. 5m) or -1; use unload() to evict",
+            "summary": "keep_alive must be a positive duration (e.g. 5m) or -1; use unload() to evict",
+        })
 
     def perform(name):
         admission = None
@@ -346,7 +455,7 @@ def _warm_impl(model: str, keep_alive: str, by: str, force: bool) -> dict:
 
 @mcp.tool()
 async def warm(model: str, keep_alive: str = "5m", by: str = "unknown",
-               force: bool = False) -> dict:
+               force: bool = False) -> ResidencyResult:
     """Load a model or refresh its keep-alive (e.g. "5m"; "-1" pins indefinitely).
 
     An already resident model requires zero additional capacity. New loads
@@ -386,19 +495,21 @@ def _ledger_call(verb: str, fn, *args) -> dict:
 def _claim_impl(model: str, owner: str, purpose: str, ttl_seconds: int) -> dict:
     outcome = _ledger_call("Claim", _claims.claim, model, owner, purpose, ttl_seconds)
     if "error" in outcome:
-        return outcome["error"]
+        return {**outcome["error"], "outcome": "refused", "model": None,
+                "reason": "ledger_error", "detail": outcome["error"]["summary"],
+                "claim_id": None, "expires_at": None}
     result = outcome["result"]
-    result["ok"] = True
-    result["outcome"] = "succeeded"
+    result = {**result, "ok": True, "outcome": "succeeded", "reason": None,
+              "detail": None}
     model = result["model"]
     result["summary"] = (
         f"Claimed '{model}' for {owner} ({purpose}), expires {result['expires_at']}."
     )
-    return result
+    return {**result, "summary": result["summary"]}
 
 
 @mcp.tool()
-async def claim(model: str, owner: str, purpose: str, ttl_seconds: int = 3600) -> dict:
+async def claim(model: str, owner: str, purpose: str, ttl_seconds: int = 3600) -> ClaimResult:
     """Declare that you're using ``model`` for ``purpose``.
 
     Lets other sessions see who's using a model and why before deciding to
@@ -418,9 +529,12 @@ def _reserve_impl(gb: float, owner: str, purpose: str, ttl_seconds: int,
         lambda: _claims.reserve(gb, owner, purpose, ttl_seconds, pid=pid),
     )
     if "error" in outcome:
-        return outcome["error"]
+        return {**outcome["error"], "outcome": "refused", "model": None,
+                "reason": "ledger_error", "detail": outcome["error"]["summary"],
+                "claim_id": None, "expires_at": None, "gb": None}
     result = outcome["result"]
-    result["ok"] = True
+    result.update({"ok": True, "outcome": "succeeded", "model": None,
+                   "reason": None, "detail": None, "gb": gb})
     result["summary"] = (
         f"Reserved {gb} GB for {owner} ({purpose}), expires "
         f"{result['expires_at']}. Other sessions' warm() calls will be refused "
@@ -431,7 +545,7 @@ def _reserve_impl(gb: float, owner: str, purpose: str, ttl_seconds: int,
 
 @mcp.tool()
 async def reserve(gb: float, owner: str, purpose: str, ttl_seconds: int = 3600,
-                  pid: Optional[int] = None) -> dict:
+                  pid: Optional[int] = None) -> ReserveResult:
     """Reserve ``gb`` GB of VRAM — a claim on capacity, not on a named model.
 
     Use this for non-Ollama GPU work (a training run, a diffusion job) so other
@@ -448,8 +562,16 @@ async def reserve(gb: float, owner: str, purpose: str, ttl_seconds: int = 3600,
 def _renew_impl(claim_id: str, ttl_seconds: Optional[int]) -> dict:
     outcome = _ledger_call("Renew", _claims.renew, claim_id, ttl_seconds)
     if "error" in outcome:
-        return outcome["error"]
+        return {**outcome["error"], "outcome": "refused", "model": None,
+                "reason": "ledger_error", "detail": outcome["error"]["summary"],
+                "claim_id": claim_id, "expires_at": None}
     result = outcome["result"]
+    result.update({"claim_id": claim_id,
+                   "expires_at": result.get("expires_at"),
+                   "outcome": "succeeded" if result["ok"] else "refused",
+                   "model": None,
+                   "reason": None if result["ok"] else "claim_not_active",
+                   "detail": None})
     result["summary"] = (
         f"Renewed, expires {result['expires_at']}." if result["ok"]
         else "No such claim (already expired or released?)."
@@ -458,7 +580,7 @@ def _renew_impl(claim_id: str, ttl_seconds: Optional[int]) -> dict:
 
 
 @mcp.tool()
-async def renew(claim_id: str, ttl_seconds: Optional[int] = None) -> dict:
+async def renew(claim_id: str, ttl_seconds: Optional[int] = None) -> RenewResult:
     """Extend an existing claim's expiry before it lapses."""
     return await _in_thread(_renew_impl, claim_id, ttl_seconds)
 
@@ -466,28 +588,38 @@ async def renew(claim_id: str, ttl_seconds: Optional[int] = None) -> dict:
 def _release_impl(claim_id: str) -> dict:
     outcome = _ledger_call("Release", _claims.release, claim_id)
     if "error" in outcome:
-        return outcome["error"]
+        return {**outcome["error"], "outcome": "refused", "model": None,
+                "reason": "ledger_error", "detail": outcome["error"]["summary"],
+                "claim_id": claim_id}
     result = outcome["result"]
+    result.update({"claim_id": claim_id,
+                   "outcome": "succeeded" if result["ok"] else "refused",
+                   "model": None,
+                   "reason": None if result["ok"] else "claim_not_found",
+                   "detail": None})
     result["summary"] = "Released." if result["ok"] else "No such claim."
     return result
 
 
 @mcp.tool()
-async def release(claim_id: str) -> dict:
+async def release(claim_id: str) -> ReleaseResult:
     """Release a claim early, before its TTL would expire."""
     return await _in_thread(_release_impl, claim_id)
 
 
 def _list_claims_impl(model: Optional[str]) -> dict:
-    outcome = _ledger_call("List claims", _claims.list_claims, model)
+    outcome = _ledger_call("List claims", _claims.list_coordination, model)
     if "error" in outcome:
-        return outcome["error"]
-    active = outcome["result"]
-    return {"claims": active, "summary": f"{len(active)} active claim(s)."}
+        return {"ok": False, "outcome": "refused", "claims": [], "operations": [],
+                "summary": outcome["error"]["summary"]}
+    state = outcome["result"]
+    return {"ok": True, "outcome": "succeeded", **state,
+            "summary": f"{len(state['claims'])} active claim(s), "
+                       f"{len(state['operations'])} pending operation(s)."}
 
 
 @mcp.tool()
-async def list_claims(model: Optional[str] = None) -> dict:
+async def list_claims(model: Optional[str] = None) -> ListClaimsResult:
     """See who's claiming what right now (all models, or one)."""
     return await _in_thread(_list_claims_impl, model)
 

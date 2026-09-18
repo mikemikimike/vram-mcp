@@ -13,18 +13,21 @@ from vram_mcp import _util, claims
 _T0 = datetime(2026, 7, 13, 18, 0, 0, tzinfo=timezone.utc)
 
 
-def _clock(start):
+class _Clock:
     """A controllable now_fn: starts at `start`, advances via .tick(seconds)."""
-    state = {"now": start}
 
-    def now_fn():
-        return state["now"]
+    def __init__(self, start: datetime) -> None:
+        self.now = start
 
-    def tick(seconds):
-        state["now"] = state["now"] + timedelta(seconds=seconds)
+    def __call__(self) -> datetime:
+        return self.now
 
-    now_fn.tick = tick
-    return now_fn
+    def tick(self, seconds: int) -> None:
+        self.now += timedelta(seconds=seconds)
+
+
+def _clock(start: datetime) -> _Clock:
+    return _Clock(start)
 
 
 def test_claim_creates_and_list_claims_returns_it(tmp_path):
@@ -418,6 +421,23 @@ def test_begin_operation_refuses_claimed_model_and_returns_claim_detail(tmp_path
     assert result["claims"][0]["model"] == "model:latest"
 
 
+def test_malformed_active_claim_still_blocks_and_is_visible(tmp_path):
+    path = tmp_path / "claims.json"
+    path.write_text(json.dumps({"claims": [{
+        "claim_id": "claim", "model": "model:latest", "owner": "owner",
+        "purpose": "purpose", "claimed_at": "2026-07-13T18:00:00Z",
+        "renewed_at": "2026-07-13T18:00:00Z", "ttl_seconds": 3600.0,
+        "expires_at": "2026-07-13T19:00:00Z",
+    }]}), encoding="utf-8")
+
+    listed = claims.list_coordination(path=path, now_fn=lambda: _T0)
+    assert listed["claims"][0]["claim_id"] == "claim"
+    assert listed["claims"][0]["ttl_seconds"] is None
+    refused = claims.begin_operation("model", "unload", path=path, now_fn=lambda: _T0)
+    assert refused["reason"] == "model_claimed"
+    assert refused["claims"][0]["claim_id"] == "claim"
+
+
 def test_pending_operation_refuses_claim_and_same_model_force_operation(tmp_path):
     path = tmp_path / "claims.json"
     started = claims.begin_operation("model", "unload", force=True, path=path, now_fn=lambda: _T0)
@@ -463,11 +483,21 @@ def test_uncertain_operation_releases_owner_lock_but_renews_durable_grace(tmp_pa
 
 @pytest.mark.parametrize("operation", ["bad", {"operation_id": "op"},
                                          {"operation_id": "op", "model": "model"}])
-def test_malformed_existing_operation_fails_closed(tmp_path, operation):
+def test_malformed_existing_operation_is_discarded_without_losing_claims(tmp_path, operation):
     path = tmp_path / "claims.json"
-    path.write_text(json.dumps({"claims": [], "operations": [operation]}), encoding="utf-8")
-    with pytest.raises(ValueError, match="malformed operation"):
-        claims.begin_operation("model", "unload", path=path, now_fn=lambda: _T0)
+    valid_claim = {
+        "claim_id": "claim", "model": "model:latest", "owner": "owner",
+        "purpose": "purpose", "claimed_at": "2026-07-13T18:00:00Z",
+        "renewed_at": "2026-07-13T18:00:00Z", "ttl_seconds": 3600,
+        "expires_at": "2026-07-13T19:00:00Z",
+    }
+    path.write_text(json.dumps({"claims": [valid_claim], "operations": [operation]}), encoding="utf-8")
+    assert [r["claim_id"] for r in claims.list_claims(path=path, now_fn=lambda: _T0)] == ["claim"]
+    started = claims.begin_operation("model", "unload", force=True, path=path, now_fn=lambda: _T0)
+    claims.finish_operation(started["operation_id"], path=path, now_fn=lambda: _T0)
+    on_disk = json.loads(path.read_text(encoding="utf-8"))
+    assert on_disk["operations"] == []
+    assert [r["claim_id"] for r in on_disk["claims"]] == ["claim"]
 
 
 def test_warm_operations_serialize_capacity_admission_by_scope(tmp_path):
@@ -505,3 +535,84 @@ def test_reservation_waits_for_any_warm_admission_to_resolve(tmp_path):
     finally:
         claims.finish_operation(started["operation_id"], path=path, now_fn=lambda: _T0)
     assert claims.reserve(8, "owner", "purpose", path=path, now_fn=lambda: _T0)["claim_id"]
+
+
+def test_list_coordination_returns_filtered_claims_and_operations(tmp_path):
+    path = tmp_path / "claims.json"
+    claims.claim("Llama3", "owner", "generation", path=path, now_fn=lambda: _T0)
+    claims.reserve(4, "trainer", "lora", path=path, now_fn=lambda: _T0)
+    started = claims.begin_operation(
+        "llama3:latest", "unload", force=True, scope="gpu:index=1",
+        path=path, now_fn=lambda: _T0,
+    )
+    try:
+        state = claims.list_coordination(path=path, now_fn=lambda: _T0)
+        assert len(state["claims"]) == 2
+        assert len(state["operations"]) == 1
+        operation = state["operations"][0]
+        assert operation["operation_id"] == started["operation_id"]
+        assert operation["model"] == "llama3:latest"
+        assert operation["scope"] == "gpu:index=1"
+        assert operation["lifecycle"] == "in_flight"
+        assert operation["outcome"] is None
+        assert operation["retry_count"] == 0
+        assert operation["retry_after"] is None
+
+        filtered = claims.list_coordination("LLAMA3", path=path, now_fn=lambda: _T0)
+        assert [entry["model"] for entry in filtered["claims"]] == ["llama3:latest"]
+        assert [entry["model"] for entry in filtered["operations"]] == ["llama3:latest"]
+    finally:
+        claims.finish_operation(started["operation_id"], path=path, now_fn=lambda: _T0)
+
+
+def test_list_coordination_reports_unknown_until_refreshed_expiry(tmp_path):
+    path = tmp_path / "claims.json"
+    clock = _clock(_T0)
+    started = claims.begin_operation("model", "unload", force=True, path=path, now_fn=clock)
+    finished = claims.finish_operation(
+        started["operation_id"], uncertain=True, reason="request_interrupted",
+        path=path, now_fn=clock,
+    )
+    state = claims.list_coordination(path=path, now_fn=clock)
+    [operation] = state["operations"]
+    assert operation["lifecycle"] == "unknown"
+    assert operation["owner_live"] is False
+    assert operation["lease_expired"] is False
+    assert operation["outcome"] == "unknown"
+    assert operation["reason"] == "request_interrupted"
+    assert operation["pending_until"] == finished["expires_at"]
+    assert operation["retry_after"] == finished["expires_at"]
+
+    clock.tick(claims._OPERATION_LEASE_SECONDS + 1)
+    assert claims.list_coordination(path=path, now_fn=clock)["operations"] == []
+
+
+def test_list_coordination_defaults_missing_pending_boundary(tmp_path):
+    path = tmp_path / "claims.json"
+    expires = "2026-07-13T18:02:00Z"
+    path.write_text(json.dumps({"claims": [], "operations": [{
+        "operation_id": "op", "model": "model:latest", "kind": "unload",
+        "started_at": "2026-07-13T18:00:00Z", "expires_at": expires,
+        "pending_until": None,
+    }]}), encoding="utf-8")
+
+    [operation] = claims.list_coordination(path=path, now_fn=lambda: _T0)["operations"]
+    assert operation["pending_until"] == expires
+
+
+def test_retry_count_survives_expiry_and_list_pruning(tmp_path):
+    path = tmp_path / "claims.json"
+    clock = _clock(_T0)
+    first = claims.begin_operation("model", "unload", force=True, path=path, now_fn=clock)
+    claims.finish_operation(first["operation_id"], uncertain=True, path=path, now_fn=clock)
+    clock.tick(claims._OPERATION_LEASE_SECONDS + 1)
+
+    # A polling read may prune the old unknown record before the retry starts.
+    assert claims.list_coordination(path=path, now_fn=clock)["operations"] == []
+    second = claims.begin_operation("model", "unload", force=True, path=path, now_fn=clock)
+    try:
+        assert second["ok"] is True
+        on_disk = json.loads(path.read_text(encoding="utf-8"))
+        assert on_disk["operations"][0]["retry_count"] == 1
+    finally:
+        claims.finish_operation(second["operation_id"], path=path, now_fn=clock)
